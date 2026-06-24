@@ -1400,7 +1400,13 @@ class Reducer:
         self._allocate_buffers()
         self._bind_params()
 
-        for start, stop, bucket in zip(self.starts, self.stops, self._buckets):
+        # NOTE: self._buckets is stored in REVERSED build order (see build_buckets:
+        # `self._buckets = list(reversed(buckets))`), but self.starts/self.stops are
+        # in build order. Zipping them directly pairs each bucket with another
+        # bucket's [start:stop] slice whenever there are >= 2 buckets (e.g. the
+        # HybridOptimizer param classes), which corrupts per-bucket grad/param
+        # buffers after an offload/wake_up cycle. Iterate buckets in build order.
+        for start, stop, bucket in zip(self.starts, self.stops, reversed(self._buckets)):
             bucket.wake_up(
                 self._contiguous_params[start:stop],
                 self._contiguous_grads[start:stop],
