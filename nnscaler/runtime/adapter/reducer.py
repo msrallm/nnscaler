@@ -391,6 +391,9 @@ class Bucket:
         # function returns None; it consumes this marker and performs the
         # normal reducer completion lifecycle exactly once.
         self._manual_grad_pending: Set[torch.nn.Parameter] = set()
+        # MergedScheduler recording window (begin/end_record_async_hook_counts):
+        # None outside the window; {param: hook fire count} inside.
+        self._async_record_counts = None
         self._hooks: List[Tuple[Any, RemovableHandle]] = []
 
         self._async: bool = async_op
@@ -610,6 +613,13 @@ class Bucket:
                 # in most cases, it is not necessary to post-evict here,
                 # let's add it for safety
                 self._reducer.postevict_param(param)
+
+            if self._async_record_counts is not None:
+                # MergedScheduler's recording microbatch runs under skip_reducer;
+                # count hook multiplicity before the skip below so the engine's
+                # begin/end_record bracket (mb0 split backward) still works.
+                self._async_record_counts[param] = \
+                    self._async_record_counts.get(param, 0) + 1
 
             if not self._grad_accumulation_steps and RuntimeFlag.skip_reducer:
                 return
@@ -836,6 +846,24 @@ class Bucket:
                 self._contiguous_grads, op=self._reduce_op,
                 group=self._group, async_op=True)
 
+    def begin_record_async_hook_counts(self):
+        """Record per-parameter gradient-hook multiplicity for split backward.
+
+        MergedScheduler (merged_schedule/engine.py) brackets microbatch-0's
+        split backward with begin/end; the recorded counts become the async
+        launch gate via set_async_grad_expected_counts (the upstream machinery
+        that replaced the original implementation of this API).
+        """
+        if not self._async:
+            return
+        self._async_record_counts = {}
+
+    def end_record_async_hook_counts(self):
+        if not self._async or self._async_record_counts is None:
+            return
+        self.set_async_grad_expected_counts(self._async_record_counts)
+        self._async_record_counts = None
+
     def set_async_grad_expected_counts(self, param_counts: Dict[torch.nn.Parameter, int]):
         self._async_expected_param_cnt = {}
         for param in self._params:
@@ -962,6 +990,7 @@ class Bucket:
 
         # These dictionaries also use parameters as keys. Leaving real keys
         # here serializes their complete (possibly shared) CUDA storage.
+        state['_async_record_counts'] = None
         for name in ('_async_expected_param_cnt', '_async_seen_param_cnt'):
             state[name] = {param_map[p]: count for p, count in getattr(self, name).items()}
 

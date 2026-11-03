@@ -308,12 +308,22 @@ class Trainer:
             # for example, profiling related args can be different,
             # so we don't want to enforce them to be the same across ranks.
             model_config = _model_config_for_checkpoint_merge(state_dicts[i]['train_args']['model'])
+            # NNSCALER_CKPT_MERGE_TOLERANT=1 keeps the fork behavior (eaded92a):
+            # mixed-provenance merges hit benign mismatches, report instead of
+            # refusing. Default raises, matching upstream and its CPU tests.
+            _tolerant = os.environ.get('NNSCALER_CKPT_MERGE_TOLERANT', '0') == '1'
             if model_config != reference_model_config:
-                # fork tolerance (eaded92a): mismatches here are expected across our
-                # mixed-provenance merges; report loudly instead of refusing.
-                print(f"model config in {checkpoint_files[i]} is different from {checkpoint_files[0]}")
+                _msg = f"model config in {checkpoint_files[i]} is different from {checkpoint_files[0]}"
+                if _tolerant:
+                    print(_msg)
+                else:
+                    raise ValueError(_msg)
             if state_dicts[i].get('lr_scheduler', None) != state_dicts[0].get('lr_scheduler', None):
-                print(f"lr_scheduler state in {checkpoint_files[i]} is different from {checkpoint_files[0]}")
+                _msg = f"lr_scheduler state in {checkpoint_files[i]} is different from {checkpoint_files[0]}"
+                if _tolerant:
+                    print(_msg)
+                else:
+                    raise ValueError(_msg)
 
         module_state_dict, opt_state_dict = nnscaler.merge_state_dicts(
             [s['model'] for s in state_dicts],

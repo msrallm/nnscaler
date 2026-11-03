@@ -94,7 +94,7 @@ def wrap_zigzag_allgather_attn_varlen_func(
     if local_process_group is None:
         local_process_group = dist.group.WORLD
 
-    output, softmax_lse = zigzag_allgather_attn_varlen_func(
+    return zigzag_allgather_attn_varlen_func(
         q,
         k,
         v,
@@ -112,7 +112,6 @@ def wrap_zigzag_allgather_attn_varlen_func(
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
     )
-    return (output, softmax_lse) if return_lse else output
 
 
 def emit_ring(

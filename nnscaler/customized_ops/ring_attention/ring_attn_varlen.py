@@ -276,7 +276,7 @@ def wrap_ring_attn_varlen_func(
                 attn_mask_type="padding_causal" if causal else "padding",
             )
             output = unshuffle_varlen(shuffled_output, cu_seqlens_q, process_group, local_process_group)
-            return (output, None) if return_lse else output
+            return output
         else:
             # Fallback to basic ring attention implementation
             if _ENABLE_TE_CP:
@@ -308,7 +308,7 @@ def wrap_ring_attn_varlen_func(
         world_size=local_world_size,
     )
 
-    output, softmax_lse = llama3_flash_attn_varlen_func(
+    out, softmax_lse = llama3_flash_attn_varlen_func(
         q,
         k,
         v,
@@ -417,7 +417,7 @@ def input_gen_fn(node: IRDimops):
             inputs.append(torch.randn(t.shape, dtype=t.dtype, device=device, requires_grad=t.requires_grad))
         elif i in [3, 4]: # cu_seqlens
             inputs.append(torch.Tensor([0, seqlen]).to(torch.int32).to(device))
-        elif i == 5: # optional alibi_slopes
+        elif i in [5]: # optional alibi_slopes
             if isinstance(t, IRTensor):
                 inputs.append(torch.randn(t.shape, dtype=t.dtype, device=device, requires_grad=t.requires_grad))
             else:
