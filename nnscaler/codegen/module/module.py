@@ -1,7 +1,8 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
-from typing import List, Optional, Tuple, Dict, Any, Literal
+from typing import List, Optional, Tuple, Dict, Any, Literal, Set, BinaryIO, Union
+from os import PathLike
 import more_itertools
 import logging
 import copy
@@ -14,7 +15,9 @@ from nnscaler.ir.cten import IRCell, IRTensor
 from nnscaler.ir.tensor import IRFullTensor, IRSubTensor
 from nnscaler.ir.operator import IRBpOperation, IRDataOperation, IRFwOperation
 from nnscaler.ir.adapter import IRWeightReducer, IRAdapter
-from nnscaler.ir.adapter.prim import CollectivePrim
+from nnscaler.ir.adapter.prim import (
+    CollectivePrim, IdentityPrim, MovePrim, ObjectMovePrim, RDScatterPrim, RDGatherPrim,
+)
 
 from nnscaler.graph.graph import IRSegment
 from nnscaler.graph.parser.register import CustomizedOps
@@ -91,7 +94,8 @@ class ModuleCodeGen(FuncEmission):
         execplan: ExecutionPlan,
         runtime_ndevs: Optional[int] = None,
         *,
-        scale_ndevs: Optional[int] = None
+        scale_ndevs: Optional[int] = None,
+        plan_ndevs: Optional[int] = None,
     ) -> None:
         """
         Create Module code generator
@@ -106,12 +110,17 @@ class ModuleCodeGen(FuncEmission):
         self.devices: Tuple[int] = tuple(sorted(execplan.graph.device))
         if self.devices != tuple(range(len(self.devices))):
             raise ValueError(f'device must be consecutive')
+        self.plan_ndevs = plan_ndevs or len(self.devices)
+        if not self.devices or self.devices[-1] >= self.plan_ndevs:
+            raise ValueError(
+                f'graph devices {self.devices} must fit within plan_ndevs={self.plan_ndevs}'
+            )
 
         if scale_ndevs is not None:
             _logger.warning("scale_ndevs is deprecated, please use runtime_ndevs instead")
             if runtime_ndevs is not None:
                 raise ValueError("You cannot use runtime_ndevs and scale_ndevs at the same time")
-        self.runtime_ndevs: int = runtime_ndevs or scale_ndevs or len(self.devices)
+        self.runtime_ndevs: int = runtime_ndevs or scale_ndevs or self.plan_ndevs
         # we will scale the graph as data parallelism
         # when we have more devices than the number of devices used in the graph
         # we need to do two things:
@@ -119,9 +128,9 @@ class ModuleCodeGen(FuncEmission):
         # 2. update node devices when emitting code (via scale)
         # TODO: Move the logic of scaling to a separate class (Maybe as a PlanPass?)
         #   It is too bad to put the scaling logic in the codegen
-        if self.runtime_ndevs % len(self.devices) != 0:
-            raise ValueError(f'runtime_ndevs must be a multiple of {len(self.devices)}')
-        self.enable_dp = self.runtime_ndevs > len(self.devices)
+        if self.runtime_ndevs % self.plan_ndevs != 0:
+            raise ValueError(f'runtime_ndevs must be a multiple of {self.plan_ndevs}')
+        self.enable_dp = self.runtime_ndevs > self.plan_ndevs
 
         self.init_code: List[str] = [
             '########## Generated Model Code ###########',
@@ -151,6 +160,11 @@ class ModuleCodeGen(FuncEmission):
                 hook_imports.add(inspect.getmodule(node.pre_hook).__name__)
             if node.post_hook is not None:
                 hook_imports.add(inspect.getmodule(node.post_hook).__name__)
+        for segment in execplan.graph.select(ntype=IRSegment):
+            if segment.pre_hook is not None:
+                hook_imports.add(inspect.getmodule(segment.pre_hook).__name__)
+            if segment.post_hook is not None:
+                hook_imports.add(inspect.getmodule(segment.post_hook).__name__)
         for modname in hook_imports:
             self.init_code.append(f'import {modname}')
             self.init_code += ['']
@@ -168,6 +182,91 @@ class ModuleCodeGen(FuncEmission):
         # communication groups
         self.comm_groups: List[Tuple[int]] = self.get_comm_groups()
         self.add_scale_reducers()
+
+    @staticmethod
+    def _is_alias_or_unknown_segment_output(
+        segment: IRSegment,
+        source: IRSubTensor,
+    ) -> bool:
+        """Return whether an output is aliased or lacks one known producer."""
+        def produces_source(cell: Any) -> bool:
+            outputs = cell.oobjs() if isinstance(cell, IRCell) else cell.outputs()
+            return any(
+                output == source and output.device == source.device
+                for output in outputs
+            )
+
+        producers = [
+            cell for cell in segment.nodes(flatten=True)
+            if produces_source(cell)
+        ]
+
+        if len(producers) != 1:
+            return True
+
+        producer = producers[0]
+        if producer.name in ('identity', 'multiref'):
+            return True
+        if not isinstance(producer, IRAdapter):
+            return False
+
+        matching_prims = [prim for prim in producer.prims if produces_source(prim)]
+        return not matching_prims or any(
+            isinstance(prim, IdentityPrim) for prim in matching_prims
+        )
+
+    @classmethod
+    def _pipeline_pseudo_free_source_tids(
+        cls,
+        sequence: List[IRCell],
+        *,
+        pipeline_enabled: bool,
+    ) -> Set[int]:
+        """Find boundary outputs whose only remaining forward use is one send adapter."""
+        if not CompileFlag.pipeline_output_pseudo_free or not pipeline_enabled:
+            return set()
+
+        forward_consumers: Dict[int, Set[IRCell]] = {}
+        segment_outputs: Dict[int, List[Tuple[IRSegment, IRSubTensor]]] = {}
+        for cell in sequence:
+            if not cell.isfw():
+                continue
+            for obj in cell.iobjs():
+                if isinstance(obj, IRSubTensor):
+                    forward_consumers.setdefault(obj.tid, set()).add(cell)
+            if isinstance(cell, IRSegment):
+                for obj in cell.oobjs():
+                    if isinstance(obj, IRSubTensor):
+                        segment_outputs.setdefault(obj.tid, []).append((cell, obj))
+
+        eligible = set()
+        for cell in sequence:
+            if not isinstance(cell, IRAdapter):
+                continue
+            if not cell.isfw() or len(cell.outputs()) != 0 or cell.mirror is None:
+                continue
+            if cell.differentiable and cell.custom:
+                continue
+
+            for source in cell.inputs():
+                if not isinstance(source, IRSubTensor):
+                    continue
+                if not source.requires_grad or source.is_attr() or source.is_grad():
+                    continue
+                if forward_consumers.get(source.tid) != {cell}:
+                    continue
+                boundaries = [
+                    (segment, output)
+                    for segment, output in segment_outputs.get(source.tid, [])
+                    if output.device == source.device
+                ]
+                if len(boundaries) != 1:
+                    continue
+                if cls._is_alias_or_unknown_segment_output(*boundaries[0]):
+                    continue
+                eligible.add(source.tid)
+
+        return eligible
 
     def add_scale_reducers(self):
         """
@@ -249,14 +348,14 @@ class ModuleCodeGen(FuncEmission):
                     zero_comm_groups.append(zero_crossgroup)
             return zero_comm_groups
 
-        nreplica = self.runtime_ndevs // len(self.devices)
+        nreplica = self.runtime_ndevs // self.plan_ndevs
         # scale communication groups
         graph = self.execplan.graph
         comm_groups = []
         # communication groups for parameters that are in reducers
         reducers: List[IRWeightReducer] = graph.select(ntype=IRWeightReducer)
         for reducer in reducers:
-            ranks = more_itertools.flatten(list(range(device, self.runtime_ndevs, len(self.devices))) \
+            ranks = more_itertools.flatten(list(range(device, self.runtime_ndevs, self.plan_ndevs)) \
                                            for device in reducer.device)
             ranks = tuple(sorted(ranks))
             comm_groups.append(ranks)
@@ -264,7 +363,7 @@ class ModuleCodeGen(FuncEmission):
             comm_groups.extend(_add_comm_for_group_zero(ranks))
         # communication groups for parameters that are outside reducers
         for device in self.devices:
-            ranks = list(range(device, self.runtime_ndevs, len(self.devices)))
+            ranks = list(range(device, self.runtime_ndevs, self.plan_ndevs))
             if len(ranks) > 1:
                 comm_groups.append(ranks)
                 # add comm groups for group ZeRO
@@ -276,16 +375,42 @@ class ModuleCodeGen(FuncEmission):
                 if isinstance(prim, CollectivePrim):
                     ranks = np.array(tuple(sorted(prim.kwargs['ranks'])), dtype=int)
                     for i in range(nreplica):
-                        shifted_ranks = tuple(ranks + i * len(self.devices))
+                        shifted_ranks = tuple(ranks + i * self.plan_ndevs)
                         shifted_ranks = tuple(int(rank) for rank in shifted_ranks)
                         if shifted_ranks not in comm_groups:
                             comm_groups.append(shifted_ranks)
         return comm_groups
 
+    def get_p2p_pairs(self):
+        """
+        Scale all actual point-to-point endpoints to runtime devices.
+        """
+        nreplica = self.runtime_ndevs // self.plan_ndevs
+        pairs = set()
+        for adapter in self.execplan.graph.select(ntype=IRAdapter):
+            for prim in adapter.prims:
+                if isinstance(prim, (MovePrim, ObjectMovePrim)):
+                    endpoints = [(prim.kwargs['src'], prim.kwargs['dst'])]
+                elif isinstance(prim, RDScatterPrim):
+                    endpoints = [(prim.kwargs['src'], dst) for dst in prim.kwargs['dsts']]
+                elif isinstance(prim, RDGatherPrim):
+                    endpoints = [(src, prim.kwargs['dst']) for src in prim.kwargs['srcs']]
+                else:
+                    continue
+                for src, dst in endpoints:
+                    if src is None or dst is None or src == dst:
+                        continue
+                    for i in range(nreplica):
+                        shifted_src = int(src) + i * self.plan_ndevs
+                        shifted_dst = int(dst) + i * self.plan_ndevs
+                        pair = (shifted_src, shifted_dst) if shifted_src < shifted_dst else (shifted_dst, shifted_src)
+                        pairs.add(pair)
+        return sorted(pairs)
+
     def scale(self, node: IRCell, device: int) -> IRCell:
         if not self.enable_dp:
             return node
-        shift = (device // len(self.devices)) * len(self.devices)
+        shift = (device // self.plan_ndevs) * self.plan_ndevs
         if isinstance(node, IRAdapter):
             adapter = copy.copy(node)
             adapter._id = node.cid
@@ -311,12 +436,12 @@ class ModuleCodeGen(FuncEmission):
                 IRCell.make_pair(adapter, badapter)
             return adapter
         if isinstance(node, IRWeightReducer):
-            reducer = IRWeightReducer(node.inputs(), name=node.name)
+            reducer = IRWeightReducer(node.inputs(), name=node.name, nreplicas=node.nreplicas)
             reducer._id = node.cid
             ranks = list(node.device)
             scale_ranks = []
             for rank in ranks:
-                scale_ranks += list(range(rank, self.runtime_ndevs, len(self.devices)))
+                scale_ranks += list(range(rank, self.runtime_ndevs, self.plan_ndevs))
             reducer.device = sorted(scale_ranks)
             return reducer
         if isinstance(node, IRSegment) and node.isfw():
@@ -337,7 +462,7 @@ class ModuleCodeGen(FuncEmission):
         as_parallel_module: bool = False,
         end2end_mode: bool = False,
         forward_args: Optional[Dict[str, Any]] = None,
-        outfile_attr_meta_map: Optional[str] = None,
+        outfile_attr_meta_map: Optional[Union[str, bytes, PathLike, BinaryIO]] = None,
     ) -> str:
         """
         Generate model implementation code based on the given graph.
@@ -426,7 +551,8 @@ class ModuleCodeGen(FuncEmission):
                 This is used only in parallel module.
             forward_args (Dict[str, Any]): argument names and their default values of forward function, if None, use node inputs.
                 This is used only in parallel module.
-            outfile_attr_meta_map (str): output file path for parameter mapping. None if don't save
+            outfile_attr_meta_map: output path or caller-owned binary stream for parameter mapping.
+                None if don't save. Streams are written at their current position and are not closed.
 
         Returns:
             generated code
@@ -435,7 +561,7 @@ class ModuleCodeGen(FuncEmission):
         node_args: List[List[str]] = list()
         gen_nodes: List[IRCell] = list()
 
-        device_map = device % len(self.devices)
+        device_map = device % self.plan_ndevs
         sequence = self.execplan.seq(device_map)
         unrolled_seqs = []
         for node in sequence:
@@ -447,6 +573,10 @@ class ModuleCodeGen(FuncEmission):
 
         # scale to multiple devices
         sequence = [self.scale(node, device) for node in sequence]
+        pseudo_free_source_tids = self._pipeline_pseudo_free_source_tids(
+            sequence,
+            pipeline_enabled=self.execplan.graph.sched is not None,
+        )
 
         # init customized adapter
         fsegments = [node for node in sequence if isinstance(node, IRSegment) and node.isfw()]
@@ -481,7 +611,22 @@ class ModuleCodeGen(FuncEmission):
             elif isinstance(node, IRFwOperation):
                 raise RuntimeError(f"Unexcepted global-level op call: {node}")
             elif isinstance(node, IRAdapter):
-                codes = self.emit_adapter(node, prefix_attr='self.', async_op=CompileFlag.async_comm)
+                from nnscaler.ir.adapter.prim import MovePrim, CommPrim, ChunkPrim, VChunkPrim
+                has_p2p = any(isinstance(prim, MovePrim) for prim in node.prims)
+                has_other_comm = any(
+                    isinstance(prim, CommPrim) and not isinstance(prim, (MovePrim, ChunkPrim, VChunkPrim))
+                    for prim in node.prims
+                )
+                codes = self.emit_adapter(
+                    node,
+                    prefix_attr='self.',
+                    async_op=(
+                        CompileFlag.async_comm
+                        or self.is_async_recv_adapter(node)
+                        or (has_p2p and not has_other_comm)
+                    ),
+                    pseudo_free_source_tids=pseudo_free_source_tids,
+                )
             elif isinstance(node, IRWeightReducer):
                 self.init_reducer(node, device, param_first_used_pos, as_parallel_module)
                 codes = self.emit_reducer(node)
@@ -511,8 +656,11 @@ class ModuleCodeGen(FuncEmission):
             node_args.append(args)
 
         if outfile_attr_meta_map:
-            with open(outfile_attr_meta_map, 'wb') as f:
-                pickle.dump(attr_meta_map, f)
+            if isinstance(outfile_attr_meta_map, (str, bytes, PathLike)):
+                with open(outfile_attr_meta_map, 'wb') as f:
+                    pickle.dump(attr_meta_map, f)
+            else:
+                pickle.dump(attr_meta_map, outfile_attr_meta_map)
 
         # generate full code
         with ClassBlock(
@@ -577,6 +725,14 @@ class ModuleCodeGen(FuncEmission):
                     cb.insert_body('@torch.jit.script_method')
                 cb.insert_body(fb.code)
 
+                if isinstance(node, IRAdapter) and self.is_async_recv_adapter(node):
+                    with FunctionBlock(func_name=f'{name}_wait', args=['self', '__pending']) as wait_fb:
+                        wait_fb.insert_body(self.emit_async_recv_adapter_wait(node))
+                        outputs = [self.tensor_name(t) for t in node.outputs()]
+                        wait_fb.insert_body(f"return {', '.join(outputs)}")
+                    cb.insert_body('')
+                    cb.insert_body(wait_fb.code)
+
                 if saved_tensors_hooks_needed:
                     with FunctionBlock(func_name=name, args=input_args) as fb:
                         # call segment under save_params_hooks context
@@ -588,10 +744,14 @@ class ModuleCodeGen(FuncEmission):
                     cb.insert_body(fb.code)
 
             if as_parallel_module:
-                if not segment_idxs:
-                    raise RuntimeError("The graph has no segment, forward code cannot be generated.")
                 cb.insert_body('')
-                if not end2end_mode:
+                if not segment_idxs:
+                    with FunctionBlock(func_name='_forward_impl', args=['self', '*args', '**kwargs']) as fb:
+                        fb.insert_body(
+                            "raise RuntimeError('This ParallelModule rank is inactive')"
+                        )
+                    cb.insert_body(fb.code)
+                elif not end2end_mode:
                     if len(segment_idxs) > 1:
                         raise RuntimeError("The graph has more than one segment, forward code cannot be generated.")
                     segment_idx = segment_idxs[0]
@@ -692,17 +852,15 @@ class ModuleCodeGen(FuncEmission):
         The fields storing intermediate codes that are populated by this method:
         - `model_init_statements`
         """
-        sign = 'self.init_group(ranks={ranks})'
-        # create single rank communication group
-        self.model_init_statements.append('# single rank communication groups')
-        with ForBlock(var='rank', iters=f'range({self.runtime_ndevs})') as fb:
-            fb.insert_body(sign.format(ranks='[rank]'))
-        self.model_init_statements.extend(fb.code)
-        # create communication group
         self.model_init_statements.append('# communication groups')
-        for ranks in self.comm_groups:
-            code = sign.format(ranks=list(ranks))
-            self.model_init_statements.append(code)
+        self.model_init_statements.append(
+            f'self.init_groups([[rank] for rank in range({self.runtime_ndevs})] + '
+            f'{[list(ranks) for ranks in self.comm_groups]})')
+        p2p_pairs = self.get_p2p_pairs()
+        if p2p_pairs:
+            self.model_init_statements.append('# P2P communication groups')
+            self.model_init_statements.append(
+                f'self.init_p2p_groups(pairs={p2p_pairs})')
         self.model_init_statements.append(' ')
 
     def init_attributes(self, node: IRCell) -> dict[str, dict[str, Any]]:
@@ -751,7 +909,7 @@ class ModuleCodeGen(FuncEmission):
                         slicers = tuple(slice(start, stop) for (start, stop) in itensor.indmap)
                         if itensor.is_scalar_tensor():
                             assert len(slicers) == 1 and slicers[0] == slice(0, 1), f"Unexpected slicers {slicers} for scalar tensor."
-                            slicers = '...'  # Ellipsis slicer for scalar tensor, x[...] is equivalent to x
+                            slicers = ()
                         val_chunks = itensor.valmap[1]
                         attr_name = self.tensor_name(itensor)
                         attr_props = dict(
@@ -765,7 +923,7 @@ class ModuleCodeGen(FuncEmission):
                         attr_meta_map[attr_name] = dict(
                             **attr_props,
                             dtype=itensor.dtype,
-                            sub_shape=tuple(itensor.shape)
+                            sub_shape=() if itensor.is_scalar_tensor() else tuple(itensor.shape)
                         )
 
                         code = map_sign.format(
@@ -807,14 +965,16 @@ class ModuleCodeGen(FuncEmission):
         zero = CompileFlag.use_zero
         zero_ngroups = CompileFlag.zero_ngroups
         reduce_op = f"'{CompileFlag.reducer_op}'"
+        nreplicas = node.nreplicas
         # reducer init interface
         reducer_init = (
             "{reducer} = nnscaler.runtime.adapter.Reducer("
             "ranks={ranks}, reduce_op={reduce_op}, "
             "async_op={async_op}, zero={zero}, max_bucket_size_bytes={max_nbytes}, "
             "zero_use_reduce_scatter={zero_use_reduce_scatter}, "
-            "zero_param_level_sharding={zero_param_level_sharding},"
-            "zero_ngroups={zero_ngroups})"
+            "zero_param_level_sharding={zero_param_level_sharding}, "
+            "zero_ngroups={zero_ngroups}, "
+            "nreplicas={nreplicas})"
         )
         reducer_add = 'self.add_reducer({reducer})'
         add_param = '{reducer}.add_param({weight})'
@@ -827,7 +987,8 @@ class ModuleCodeGen(FuncEmission):
             reducer=reducer_name, ranks=ranks, reduce_op=reduce_op,
             async_op=async_op, zero=zero, max_nbytes=max_nbytes,
             zero_ngroups=zero_ngroups, zero_use_reduce_scatter=zero_use_reduce_scatter,
-            zero_param_level_sharding=zero_param_level_sharding
+            zero_param_level_sharding=zero_param_level_sharding,
+            nreplicas=nreplicas
         )
         self.model_init_statements.append(init_code)
         # sort weights by first used time (which is gradient all-reduce time in reverse order)
@@ -964,7 +1125,7 @@ class ModuleCodeGen(FuncEmission):
                                     f'we set clone_level=1 to avoid in-place modification issue.')
                     node.kwargs['clone_level'] = 1
 
-                code = self.emit_fnode(node, runtime_devid=runtime_devid, plan_ndevs=len(self.devices), runtime_ndevs=self.runtime_ndevs, prefix_attr='self.')
+                code = self.emit_fnode(node, runtime_devid=runtime_devid, plan_ndevs=self.plan_ndevs, runtime_ndevs=self.runtime_ndevs, prefix_attr='self.')
 
                 if not param_inputs or CompileFlag.use_zero <= 1:
                     node_code += code

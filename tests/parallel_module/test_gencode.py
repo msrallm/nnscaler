@@ -62,6 +62,40 @@ def test_codegen():
         launch_torchrun(1, _gencode_worker, tempdir)
 
 
+def _first_device_only(graph, _config):
+    from nnscaler.ir import IRDataOperation, IRFwOperation
+
+    for node in graph.select(ntype=(IRFwOperation, IRDataOperation)):
+        graph.assign(node, 0)
+    return graph
+
+
+@replace_all_device_with('cpu')
+def test_codegen_supports_inactive_plan_rank():
+    with tempfile.TemporaryDirectory() as tempdir:
+        parallelize(
+            Module0(),
+            {'x': torch.tensor([[1.0, 2.0, 3.0]])},
+            _first_device_only,
+            ComputeConfig(2, 4),
+            gen_savedir=tempdir,
+            load_module=False,
+        )
+        assert _gencode_contains(
+            tempdir,
+            Module0,
+            1,
+            r"This ParallelModule rank is inactive",
+        )
+        assert _gencode_contains(tempdir, Module0, 2, r"torch\.nn\.functional\.linear")
+        assert _gencode_contains(
+            tempdir,
+            Module0,
+            3,
+            r"This ParallelModule rank is inactive",
+        )
+
+
 class SliceModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -383,24 +417,24 @@ class AttrModule(torch.nn.Module):
         return x + getattr(attr, 'a')
 
 
-def print_gencode(cubesave_dir, module_class, index=0):
-    from nnscaler.parallel import _PARALLEL_MODULE_NAMESPACE, _get_full_qualified_name, _DEFAULT_INSTANCE_NAME
-    from pathlib import Path
-    import re
-    namespace = f'{_PARALLEL_MODULE_NAMESPACE}.{_get_full_qualified_name(module_class)}.{_DEFAULT_INSTANCE_NAME}'
-    outdir: Path = cubesave_dir / Path(namespace.replace('.', '/').strip('/'))
-    filecontent = (outdir /f'gencode{index}.py').read_text()
-    print(filecontent)
-
-
-def _gencode_contains(cubesave_dir, module_class, index, search_re, *, instance_name=None):
+def print_gencode(cubesave_dir, module_class, index=0, instance_name=None):
     from nnscaler.parallel import _PARALLEL_MODULE_NAMESPACE, _get_full_qualified_name, _DEFAULT_INSTANCE_NAME
     from pathlib import Path
     import re
     namespace = f'{_PARALLEL_MODULE_NAMESPACE}.{_get_full_qualified_name(module_class)}.{instance_name or _DEFAULT_INSTANCE_NAME}'
     outdir: Path = cubesave_dir / Path(namespace.replace('.', '/').strip('/'))
     filecontent = (outdir /f'gencode{index}.py').read_text()
-    matches = re.findall(search_re, filecontent)
+    print(filecontent)
+
+
+def _gencode_contains(cubesave_dir, module_class, index, search_re, *, instance_name=None, flags=0):
+    from nnscaler.parallel import _PARALLEL_MODULE_NAMESPACE, _get_full_qualified_name, _DEFAULT_INSTANCE_NAME
+    from pathlib import Path
+    import re
+    namespace = f'{_PARALLEL_MODULE_NAMESPACE}.{_get_full_qualified_name(module_class)}.{instance_name or _DEFAULT_INSTANCE_NAME}'
+    outdir: Path = cubesave_dir / Path(namespace.replace('.', '/').strip('/'))
+    filecontent = (outdir /f'gencode{index}.py').read_text()
+    matches = re.findall(search_re, filecontent, flags)
     return matches
 
 
@@ -989,12 +1023,7 @@ def test_codegen_end2end():
                     r"self\.register_parameter"
             )
             p(tempdir, use_pipeline=use_pipeline, constant_folding=True, return_type=0)  # should success
-            if use_pipeline:
-                with raises_with_cause(RuntimeError, match='.*Communication generation.*'):
-                    # fail for non-tensor IRObject return in pipeline mode
-                    p(tempdir, use_pipeline=use_pipeline, constant_folding=False, return_type=1)
-            else:
-                p(tempdir, use_pipeline=use_pipeline, constant_folding=False, return_type=1)
+            p(tempdir, use_pipeline=use_pipeline, constant_folding=False, return_type=1)
             p(tempdir, use_pipeline=use_pipeline, constant_folding=True, return_type=1)  # should success
             p(tempdir, use_pipeline=use_pipeline, constant_folding=False, return_type=2)  # should success
             p(tempdir, use_pipeline=use_pipeline, constant_folding=True, return_type=2)  # should success
@@ -1386,7 +1415,7 @@ def test_codegen_scalar_tensor(tmp_path):
     #     # communication groups
 
     #     self.register_buffer('num_batches_tracked_33', torch.empty((), dtype=torch.int64), persistent=True)
-    #     self.add_full_map('num_batches_tracked_33', 2, False, 'num_batches_tracked', (), ..., 1)
+    #     self.add_full_map('num_batches_tracked_33', 2, False, 'num_batches_tracked', (), (), 1)
 
     #     self.register_parameter('proj_weight_35', torch.nn.Parameter(torch.empty((1024, 1024), dtype=torch.float32)))
     #     self.add_full_map('proj_weight_35', 4, True, 'proj.weight', (1024, 1024), (slice(0, 1024, None), slice(0, 1024, None)), 1)
@@ -1420,7 +1449,7 @@ def test_codegen_scalar_tensor(tmp_path):
     assert _gencode_contains(tmp_path, ScalarTensorModule, 0,
         r"self\.register_buffer\('num_batches_tracked_\d+', torch\.empty\(\(\), dtype=torch\.int64\), persistent=True\)")
     assert _gencode_contains(tmp_path, ScalarTensorModule, 0,
-        r"self\.add_full_map\('num_batches_tracked_\d+', \d+, False, 'num_batches_tracked', \(\), \.\.\., 1\)")
+        r"self\.add_full_map\('num_batches_tracked_\d+', \d+, False, 'num_batches_tracked', \(\), \(\), 1\)")
 
 
 class ImportlibModel(torch.nn.Module):

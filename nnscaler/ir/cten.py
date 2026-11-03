@@ -78,6 +78,7 @@ class IRCell:
         self._comment: Optional[str] = None
         # the module stack that preserves the hierarchy information
         self._module_stack: Optional[OrderedDict[str, Any]] = None
+        self._module_call_stack: Optional[OrderedDict[str, int]] = None
         # the original call expression
         # Note:
         # 1. some cells may not have call expression if the cell is not from function call (e.g., __getitem__)
@@ -423,6 +424,15 @@ class IRCell:
         Set the module stack
         """
         self._module_stack = stack
+
+    @property
+    def module_call_stack(self) -> Optional[OrderedDict[str, int]]:
+        """Per-trace invocation IDs keyed by the FQNs in ``module_stack``."""
+        return getattr(self, '_module_call_stack', None)
+
+    @module_call_stack.setter
+    def module_call_stack(self, stack: Optional[OrderedDict[str, int]]):
+        self._module_call_stack = stack
 
     @property
     def module_class_chain(self) -> list[type[torch.nn.Module]]:
@@ -834,9 +844,27 @@ class IRObject:
 
     def __copy__(self):
         """Copy this object but remove the cell information"""
+        if type(self) is not IRObject:
+            raise TypeError("__copy__() is only supported for IRObject, but got type {}".format(type(self)))
+
         if self is IRObject.missing:  # missing object is singleton
             return IRObject.missing
         return IRObject(self.name, self._id, self._value, self.is_constant, value_track=self._value_track)
+
+    def like(self):
+        """
+        Create a IRObject with same attributes but a different id and empty cell.
+        """
+        if type(self) is not IRObject:
+            raise TypeError("like() is only supported for IRObject, but got type {}".format(type(self)))
+
+        if self is IRObject.missing:  # missing object is singleton
+            return IRObject.missing
+
+        obj = IRObject(
+            self.name, None, self._value, self.is_constant, value_track=self._value_track
+        )
+        return obj
 
     def as_attr(self):
         """
@@ -1110,17 +1138,17 @@ class IR:
         return IRCell.modify_objects_of_complex(val, modifier)
 
     @classmethod
-    def modify_objects_inplace(cls, val: Any, modifier: Callable[['IRObject'], None]) -> None:
-        """Modify a complex data structure inplace
+    def modify_objects_inplace(cls, val: Any, modifier: Callable[['IRObject'], None]) -> Any:
+        """Modify a complex data structure inplace.
 
         Supported complex of types: List, Tuple, Dict, Slice, IRTensor, IRObject
 
         Args:
             val (Any): the complex data structure to be modified
-            modifier (Callable): a modifier that takes an IRObject and return nothing.
+            modifier (Callable): a modifier that takes an IRObject and returns nothing.
 
-        Return:
-            None
+        Returns:
+            The input val (for chaining convenience).
         """
         rcall = cls.modify_objects_inplace
         if isinstance(val, (list, tuple)):
@@ -1181,6 +1209,73 @@ class IR:
         Check if the value is an IRObject
         """
         return isinstance(val, IRObject) and (include_ir_tensor or not isinstance(val, IRTensor))
+
+    @classmethod
+    def set_object_device(cls, val: Any, device: Union[int, List[int]]) -> Any:
+        """Set the device of IRObjects in a (possibly complex) data structure.
+
+        Creates a lightweight dummy cell to hold the device assignment,
+        since device is a property of IRCell, not IRObject directly.
+
+        Args:
+            val: an IRObject or complex structure containing IRObjects
+            device: the device id(s) to assign
+
+        Returns:
+            The same val (modified in-place).
+        """
+        def modifier(obj: IRObject) -> None:
+            obj.cell = IRCell(
+                name='_dev_holder',
+                signature='dummy',
+                input_length=1, output_length=1
+            )
+            obj.cell.device = device
+
+        return cls.modify_objects_inplace(val, modifier)
+
+    @classmethod
+    def copy_and_set_object_device(cls, val: Any, device: Union[int, List[int]]) -> Any:
+        """Copy the IRObject and set the device of the copy.
+
+        Creates a lightweight dummy cell to hold the device assignment,
+        since device is a property of IRCell, not IRObject directly.
+
+        Args:
+            val: an IRObject or complex structure containing IRObjects
+            device: the device id(s) to assign
+
+        Returns:
+            A copy of val with the device set.
+        """
+        return cls.set_object_device(cls.modify_objects(val, copy.copy), device)
+
+    @classmethod
+    def index_with_same_parent(cls, tensor: IRObject, tensors: List[IRObject]) -> Optional[int]:
+        """
+        Find the index of a tensor in a list of tensors that shares the same parent.
+
+        Args:
+            tensor (IRObject): The tensor to find.
+            tensors (List[IRObject]): The list of tensors to search.
+
+        Returns:
+            Optional[int]: The index of the tensor with the same parent, or None if not found.
+        """
+        exact = [
+            idx for idx, candidate in enumerate(tensors)
+            if isinstance(candidate, IRObject) and candidate.tid == tensor.tid
+        ]
+        if len(exact) == 1:
+            return exact[0]
+        if len(exact) > 1:
+            return None
+
+        parent_matches = [
+            idx for idx, candidate in enumerate(tensors)
+            if isinstance(candidate, IRObject) and candidate.parent == tensor.parent
+        ]
+        return parent_matches[0] if len(parent_matches) == 1 else None
 
 
 class IRTensor(IRObject):

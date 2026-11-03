@@ -7,6 +7,7 @@ import types
 from typing import Callable, Any, Dict, Iterable, Optional, Tuple, Type, Union, TypeVar, List, Set, Literal
 from pathlib import Path
 import inspect
+import itertools
 import sys
 import importlib
 from dataclasses import dataclass, asdict, field, replace
@@ -14,12 +15,19 @@ from contextlib import contextmanager
 import logging
 import copy
 import os
+import shutil
+import subprocess
+import tempfile
+import threading
+import time
 from collections import OrderedDict, defaultdict
 
 import torch
 import torch.distributed
 
 from nnscaler.codegen import ModuleCodeGen
+from nnscaler.codegen.metadata import compact_metadata_payloads, compact_worker_metadata, worker_metadata_filename
+from nnscaler.codegen.serialization import dump_codegen_payload
 from nnscaler.codegen.schedule.schedule import ScheduleCodeGen
 
 from nnscaler.execplan import ExecutionPlan
@@ -43,6 +51,7 @@ from nnscaler.ir.unique import IDGenerator
 
 from nnscaler.runtime.adapter.reducer import Bucket, Reducer, ParamZeroConfig
 from nnscaler.runtime.device import DeviceGroup
+from nnscaler.runtime.checkpoint_broadcast import broadcast_checkpoint_tensors
 from nnscaler.runtime.gnorm import calcuate_gnorm, clip_grads
 from nnscaler.runtime.module import (
     AttrMeta,
@@ -53,6 +62,8 @@ from nnscaler.runtime.module import (
     ExtraState,
     dedup_attrs,
     NonParallelModule,
+    merged_load_session,
+    load_merged_module,
 )
 
 from nnscaler.flags import CompileFlag, RuntimeFlag
@@ -86,6 +97,26 @@ _PREDEFINED_POLICIES_NAME_PREFIX = 'pas_'
 for k, v in policies.__dict__.items():
     if callable(v) and k.startswith(_PREDEFINED_POLICIES_NAME_PREFIX):
         _PREDEFINED_POLICIES[k[len(_PREDEFINED_POLICIES_NAME_PREFIX):]] = v
+
+
+def _user_config_for_reuse(user_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Ignore the VL checkpoint's location, preserving its model configuration.
+
+    Training can stage the same Vision weights in a per-job local directory.
+    Normalize both saved and current configs so existing packages remain usable.
+    Copy only the dictionaries on this path; never change runtime model args or
+    the saved config, and do not ignore similarly named keys elsewhere.
+    """
+    result = user_config.copy()
+    current = result
+    for key in ('__from_trainer_args', 'model_args', 'model_args'):
+        child = current.get(key)
+        if not isinstance(child, dict):
+            return user_config
+        current[key] = child.copy()
+        current = current[key]
+    current.pop('vision_encoder_path', None)
+    return result
 
 
 @dataclass(frozen=True)
@@ -131,6 +162,13 @@ class ComputeConfig:
     #  2. the first return value of `module.forward` must be the loss
     #  which must be a scalar tensor
     use_end2end: bool = False
+    # whether to use FBW schedules or FB schedules. Default is False (FB schedules).
+    # only effective when `use_end2end` is True and `inference_only` is False.
+    # Only useful for pipeline training with multi-stream scheduling or `use_async_common` is True.
+    use_fbw: bool = False
+    # whether to use async communication for cross-stage collective operations.
+    # This option only works for pipeline.
+    use_async_comm: bool = False
 
     # whether to use async reducer
     # if True, the gradient all-reduce will be async,
@@ -140,6 +178,10 @@ class ComputeConfig:
     # It is also effective for sync reducer.
     # None/0 means using the default value. (25MB for async, no limit for sync)
     reducer_bucket_cap_mb: Optional[float] = None
+    # whether to generate weight reducers for replicated weights.
+    # When True, replicated weights will also go through all-reduce (with nreplicas division),
+    # ensuring gradient consistency across ranks. Default is False.
+    reducer_replicated_params: bool = False
 
     # PAS policy settings
     # you can also put any other settings that can affect code generation here.
@@ -224,6 +266,19 @@ class ComputeConfig:
         if self.use_zero and self.zero_use_reduce_scatter and self.zero_ngroups != 1:
             raise ValueError("zero_use_reduce_scatter is only supported when zero_ngroups is 1.")
 
+        if self.use_fbw:
+            if not self.use_end2end:
+                raise ValueError("use_fbw is only supported in end2end mode.")
+            if self.inference_only:
+                raise ValueError("use_fbw is not supported in inference mode.")
+
+            from nnscaler.runtime._patch_torch import FBW_SUPPORTED
+            if not FBW_SUPPORTED:
+                raise ValueError(
+                    "fbw is not supported in the current environment. "
+                    "Please update pytorch(2.5.0+) and/or python(3.10+) to a higher version."
+                )
+
     def apply_pipeline_scheduler(
             self,
             graph: IRGraph,
@@ -273,7 +328,7 @@ class ComputeConfig:
     def graph_config(self) -> Dict[str, Any]:
       return {
             'constant_folding': self.constant_folding,
-            'user_config': self.user_config,
+            'user_config': _user_config_for_reuse(self.user_config),
             'inference_only': self.inference_only, # there will be no backward nodes in the graph in inference mode
             'end2end_mode': self.use_end2end,  # end2end_mode can affect the graph generation.
             'trace_strategy': self.trace_strategy,  # different strategy might lead to different graph
@@ -322,16 +377,7 @@ class ComputeConfig:
         Returns:
             Tuple[List[int], torch.distributed.ProcessGroup]: return the rank list of the group and its torch.distributed group
         """
-        rank = torch.distributed.get_rank()
-        # create all groups
-        plan_ngpus = self.plan_ngpus
-        runtime_ngpus = self.runtime_ngpus
-        for i in range(plan_ngpus):
-            DeviceGroup().get_group(
-                list(range(i, runtime_ngpus, plan_ngpus))
-            )
-        rank_list = list(range(rank % plan_ngpus, runtime_ngpus, plan_ngpus))
-        return rank_list, DeviceGroup().get_group(rank_list)
+        return DeviceGroup().get_sync_group(self.plan_ngpus, self.runtime_ngpus)
 
     @classmethod
     def safe_dump_to_file(cls, cfg: 'ComputeConfig', file: Union[str, Path]) -> None:
@@ -369,11 +415,13 @@ class ComputeConfig:
     @classmethod
     def safe_equals(cls, a: Optional['ComputeConfig'], b: Optional['ComputeConfig']) -> bool:
         """
-        Return False if a and b are from incompatible version of ComputeConfig
-        This is only for backward compatibility, and will be removed in future
-        and can use `==` when we save dict version of ComputeConfig to file.
+        Compare configs for reuse, allowing the VL checkpoint path to change.
+        Return False for incompatible versions of ComputeConfig.
         """
         try:
+            if isinstance(a, cls) and isinstance(b, cls):
+                a = replace(a, user_config=_user_config_for_reuse(a.user_config))
+                b = replace(b, user_config=_user_config_for_reuse(b.user_config))
             return a == b
         except AttributeError:
             logger.warning("Failed to compare ComputeConfig. They are incompatible.")
@@ -398,12 +446,14 @@ def _compile_flags(compute_config: ComputeConfig):
         CompileFlag,
         async_reducer=compute_config.use_async_reducer, reducer_op='sum',
         max_reducer_bucket=compute_config.max_bucket_size_bytes,
-        async_comm=False,
+        async_comm=compute_config.use_async_comm,
         use_zero=compute_config.use_zero,
         zero_ngroups=compute_config.zero_ngroups,
         zero_use_reduce_scatter=compute_config.zero_use_reduce_scatter,
         trace_strategy=compute_config.trace_strategy,
         zero_param_level_sharding=compute_config.zero_param_level_sharding,
+        reducer_replicated_params=compute_config.reducer_replicated_params,
+        use_fbw=compute_config.use_fbw,
     )
 
 
@@ -508,6 +558,10 @@ _GRAPH_DUMP_FILE = 'graph.ckp'
 _FORWARD_ARGS_DUMP_FILE = 'forward_args.pkl'
 
 
+class _CodegenWorkerError(RuntimeError):
+    """A local codegen subprocess failed and its captured logs are available."""
+
+
 class ReuseType(Enum):
     """The reuse type"""
     MATCH = 'match'        # reuse if present and match, error if present but not match, generate if not present.
@@ -525,6 +579,7 @@ class BroadcastGenFilesStrategy(Enum):
     1. config file: compute config (compute_config.pt)
     2. trace files: graph dump (graph.ckp), forward args dump(forward_args.pkl),
        origin module metadata (origin_module_metadata.pt), init weights file(fullmodel.pt.*),
+       non-persistent buffer file (npbuffer.pt),
        param name mapping (dist_param_map.pt)
     3. code: generated code files (gencode*.py)
 
@@ -540,13 +595,15 @@ class BroadcastGenFilesStrategy(Enum):
     # please note the init weight files can be huge.
     ALL = 'all'
 
-    # broadcast all new generated files except init weights (fullmodel.pt.*).
+    # broadcast all new generated files except init weights (fullmodel.pt.*, npbuffer.pt).
     # Without weights,
-    # you can only construct the parallel module with `init_params=False`.
-    # You can then
+    # you can only construct parallel modules that have no non-persistent buffers with `init_params=False`.
+    # Non-persistent buffers (npbuffer.pt) are also excluded because they are
+    # part of the model weights. You can then
     # 1. Load the weights from a checkpoint file with `module.load_state_dict` or `load_merged_state_dict`
     # 2. Or you can use `broadcast_weights` to get the weights from the workers in node0.
     #    (local world size should be bigger than plan_ngpus)
+    #    `broadcast_weights` will also broadcast non-persistent buffers and mark them as initialized.
     NO_WEIGHTS = 'no_weights'
 
     # broadcast the new generated code (gencode*.py) and compute_config.pt only.
@@ -579,12 +636,55 @@ def _prepare_namespace(
     return namespace, outdir
 
 
+def _config_difference_paths(saved, current, prefix=''):
+    """Report differing keys without logging arbitrary user-config values."""
+    if isinstance(saved, dict) and isinstance(current, dict):
+        for key in sorted(saved.keys() | current.keys(), key=str):
+            path = f'{prefix}.{key}' if prefix else str(key)
+            if key not in saved or key not in current:
+                yield path
+            else:
+                yield from _config_difference_paths(saved[key], current[key], path)
+    elif saved != current:
+        yield prefix
+
+
+def _reuse_mismatch_details(old_config, compute_config, is_config_match,
+                            existing_files, expected_candidates):
+    details = [f'ComputeConfig match: {is_config_match}.']
+    if not is_config_match:
+        if old_config is None:
+            details.append('Saved compute_config.pt is missing or could not be loaded.')
+        else:
+            try:
+                saved, current = asdict(old_config), asdict(compute_config)
+                for config in (saved, current):
+                    config['user_config'] = _user_config_for_reuse(config['user_config'])
+                paths = list(itertools.islice(_config_difference_paths(
+                    saved, current), 21))
+                details.append('Differing config fields: ' + ', '.join(paths[:20])
+                               + (', ...' if len(paths) > 20 else '') + '.')
+            except Exception:
+                details.append('Saved and current ComputeConfig could not be inspected.')
+    existing = set(existing_files)
+    expected = min((set(files) for files in expected_candidates),
+                   key=lambda files: len(files ^ existing))
+    for label, files in (('Missing files', expected - existing),
+                         ('Unexpected files', existing - expected)):
+        names = sorted(path.name for path in files)
+        if names:
+            details.append(f'{label}: ' + ', '.join(names[:20])
+                           + (', ...' if len(names) > 20 else '') + '.')
+    return ' '.join(details)
+
+
 def _prepare_and_check_reusable(
         gen_savedir: str,
         module_or_module_class: Union[Type[torch.nn.Module], torch.nn.Module],
         compute_config: ComputeConfig,
         instance_name: Optional[str] = None,
         reuse: ReuseType = ReuseType.MATCH,
+        allow_missing_init_weights: bool = False,
     ) -> Tuple[str, bool]:
     """
     Prepare the output directory for code generation, and also check if the existing code is reusable.
@@ -640,26 +740,41 @@ def _prepare_and_check_reusable(
     if reuse == ReuseType.MATCH or reuse == ReuseType.MOO:
         # check if the module is already generated
         expected_output_files = [outdir / _GENCODE_FILE_TEMPLATE.format(rank) for rank in range(compute_config.runtime_ngpus)]
-        expected_output_files.extend([
-            outdir / ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank)
-            for rank in range(compute_config.runtime_ngpus)
-        ])
         expected_output_files.extend(trace_meta_files)
+        if (outdir / FxModuleParser.ATTR_CONTENT_INDEX_FILE).exists():
+            expected_output_files.append(outdir / FxModuleParser.ATTR_CONTENT_INDEX_FILE)
         expected_output_files.append(config_file)
         expected_output_files.append(outdir / _GRAPH_DUMP_FILE)
         expected_output_files.append(outdir / _FORWARD_ARGS_DUMP_FILE)
         expected_output_files.append(outdir / ParallelModule.ORIGIN_MODULE_METADATA_FILE)
+        expected_output_files.append(outdir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
+        # A resume-only staged package can omit initial weights, which would
+        # be overwritten by the checkpoint. All code, configuration, mapping,
+        # graph metadata, and non-persistent buffers are still mandatory.
+        if allow_missing_init_weights and not (outdir / FxModuleParser.ATTR_CONTENT_FILE_0).exists():
+            expected_output_files.remove(outdir / FxModuleParser.ATTR_CONTENT_FILE_0)
+        compact_expected_output_files = expected_output_files + [outdir / ParallelModule.ATTR_META_FILE]
+        legacy_expected_output_files = expected_output_files + [
+            outdir / ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank)
+            for rank in range(compute_config.runtime_ngpus)
+        ]
         existing_output_files = [
             f for f in outdir.glob('*')
             if f.is_file() and (  # just take fullmodel.pt.0 to compare
                 not f.name.startswith(FxModuleParser.ATTR_CONTENT_FILE_STEM)
-                or f.name == FxModuleParser.ATTR_CONTENT_FILE_0
+                or f.name in (
+                    FxModuleParser.ATTR_CONTENT_FILE_0,
+                    FxModuleParser.ATTR_CONTENT_INDEX_FILE,
+                )
             )
         ]
         if existing_output_files:
-            if is_config_match \
-                and all([output_file.exists() for output_file in expected_output_files]) \
-                and len(existing_output_files) == len(expected_output_files):
+            output_files_match = any(
+                all(output_file.exists() for output_file in candidate)
+                and len(existing_output_files) == len(candidate)
+                for candidate in (compact_expected_output_files, legacy_expected_output_files)
+            )
+            if is_config_match and output_files_match:
                 reusable = True  # everything is matched.
             elif is_config_match \
                 and all(f.suffix != '.py'  for f in existing_output_files):
@@ -673,10 +788,16 @@ def _prepare_and_check_reusable(
                 if not all([meta_file.exists() for meta_file in trace_meta_files]):
                     _clean_files(outdir)
             elif reuse == ReuseType.MATCH:
+                details = _reuse_mismatch_details(
+                    old_config, compute_config, is_config_match,
+                    existing_output_files,
+                    (compact_expected_output_files, legacy_expected_output_files))
                 raise RuntimeError(f'Output directory {outdir} is not empty. '
                                    f'And the existing files do not match with current config. '
-                                   f'You can remove the directory and try again, '
-                                   f'or set reuse to ReuseType.NONE/ReuseType.OVERRIDE to regenerate the code.')
+                                   f'{details} '
+                                   f'Check the source revision, launch arguments, and staged files. '
+                                   f'If regeneration is needed, regenerate the canonical package '
+                                   f'with the intended config and stage it again.')
             else:
                 assert reuse == ReuseType.MOO
                 if _is_any_gencode_loaded(namespace):
@@ -782,6 +903,7 @@ def _gencode(
         module_dtype:  Optional[torch.dtype] = None,
         module_fn: Optional[Callable[[], torch.nn.Module]] = None,
         autoset_requires_grad: bool = True,
+        codegen_workers: int = 1,
     ) -> RegenStatus:
     """
     Generate parallel module source code from a torch module, and save it to file.
@@ -802,9 +924,13 @@ def _gencode(
         module_dtype (Optional[torch.dtype]): the dtype of the module. Keep as it is when it is None.
         module_fn (Optional[Callable[[], torch.nn.Module]]): the function to create the module. Will use __init__ if it is None.
         autoset_requires_grad (bool): whether to automatically set the requires_grad of input tensors.
+        codegen_workers (int): number of local subprocesses used for per-rank code generation.
     Returns:
         RegenStatus: which part is regenerated.
     """
+    if isinstance(codegen_workers, bool) or not isinstance(codegen_workers, int) or codegen_workers < 1:
+        raise ValueError(f'codegen_workers must be a positive integer, got {codegen_workers!r}')
+
     graph_ckp = outdir / _GRAPH_DUMP_FILE
     forward_args_ckp = outdir / _FORWARD_ARGS_DUMP_FILE
     origin_module_metadata_ckp = outdir / ParallelModule.ORIGIN_MODULE_METADATA_FILE
@@ -865,13 +991,6 @@ def _gencode(
     if not isinstance(graph, IRGraph):
         raise RuntimeError("Expected policy return IRGraph")
 
-    # currently graph.sched is only used for pipeline parallelism
-    # so it is not none means we are in pipeline parallelism
-    if graph.sched is not None and _contains_uncommutable_data(graph.outputs()):
-        raise RuntimeError("Communication generation error: "
-                           "some of outputs are not commutable between gpus, "
-                           "which is not supported in pipeline parallelism.")
-
     # check assignment
     for node in graph.nodes(flatten=True):
         # skip graph anchor: will be removed
@@ -900,32 +1019,302 @@ def _gencode(
         execplan = Grouping.apply(execplan)
 
     # code generation
-    assert len(execplan.graph.device) == compute_config.plan_ngpus, f"{execplan.graph.device}"
-    mgener = ModuleCodeGen(execplan, compute_config.runtime_ngpus)
+    if (
+        not execplan.graph.device
+        or min(execplan.graph.device) < 0
+        or max(execplan.graph.device) >= compute_config.plan_ngpus
+    ):
+        raise RuntimeError(
+            "Graph devices must be a non-empty subset of the NNScaler plan: "
+            f"devices={execplan.graph.device} plan_ngpus={compute_config.plan_ngpus}"
+        )
+    mgener = ModuleCodeGen(
+        execplan,
+        compute_config.runtime_ngpus,
+        plan_ndevs=compute_config.plan_ngpus,
+    )
     sgener = None
     if compute_config.use_end2end:
         sgener = ScheduleCodeGen(execplan, compute_config.runtime_ngpus)
-    for rank in range(compute_config.runtime_ngpus):
-        fname = outdir / _GENCODE_FILE_TEMPLATE.format(rank)
-        attr_meta_map_fname = outdir / ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank)
-        mgener.gen(rank,
-            forward_args=forward_args,
-            outfile=fname,
-            attach=False,
-            as_parallel_module=True,
-            end2end_mode=compute_config.use_end2end,
-            outfile_attr_meta_map=attr_meta_map_fname
+
+    actual_codegen_workers = min(codegen_workers, compute_config.runtime_ngpus)
+    if actual_codegen_workers > 1:
+        _gencode_in_subprocesses(
+            mgener,
+            sgener,
+            forward_args,
+            compute_config,
+            outdir,
+            actual_codegen_workers,
         )
-        # generate temporal schedule code only for end2end module
-        # because the code generated is wrong for non-end2end module.
-        if compute_config.use_end2end:
-            sgener.gen(
-                device=rank,
+        return ret
+
+    staging_dir = Path(tempfile.mkdtemp(prefix='.nnscaler-codegen-', dir=outdir))
+    try:
+        for rank in range(compute_config.runtime_ngpus):
+            fname = staging_dir / _GENCODE_FILE_TEMPLATE.format(rank)
+            attr_meta_map_fname = staging_dir / ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank)
+            mgener.gen(rank,
+                forward_args=forward_args,
                 outfile=fname,
-                attach=True
+                attach=False,
+                as_parallel_module=True,
+                end2end_mode=compute_config.use_end2end,
+                outfile_attr_meta_map=attr_meta_map_fname
             )
+            # generate temporal schedule code only for end2end module
+            # because the code generated is wrong for non-end2end module.
+            if compute_config.use_end2end:
+                sgener.gen(
+                    device=rank,
+                    outfile=fname,
+                    attach=True
+                )
+        _compact_attr_meta_files(staging_dir, compute_config.runtime_ngpus)
+        _promote_codegen_outputs(staging_dir, outdir, compute_config.runtime_ngpus)
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
     return ret
+
+
+def _compact_attr_meta_files(staging_dir: Path, runtime_ngpus: int) -> int:
+    """Deduplicate staged per-rank pickle payloads into one versioned metadata file."""
+    count = compact_metadata_payloads(staging_dir, (
+        (staging_dir / ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank)).read_bytes()
+        for rank in range(runtime_ngpus)
+    ))
+    logger.info(
+        'Compacted %d per-rank attribute metadata files into %d unique variants',
+        runtime_ngpus,
+        count,
+    )
+    return count
+
+
+def _remove_legacy_attr_meta_files(outdir: Path) -> None:
+    for path in outdir.glob(f'{ParallelModule.ATTR_META_FILE_PREFIX}*.pkl'):
+        rank = path.stem[len(ParallelModule.ATTR_META_FILE_PREFIX):]
+        if rank.isdigit():
+            path.unlink(missing_ok=True)
+
+
+def _promote_codegen_outputs(staging_dir: Path, outdir: Path, runtime_ngpus: int) -> None:
+    for rank in range(runtime_ngpus):
+        filename = _GENCODE_FILE_TEMPLATE.format(rank)
+        os.replace(staging_dir / filename, outdir / filename)
+    os.replace(
+        staging_dir / ParallelModule.ATTR_META_FILE,
+        outdir / ParallelModule.ATTR_META_FILE,
+    )
+    _remove_legacy_attr_meta_files(outdir)
+
+
+def _partition_codegen_ranks(runtime_ngpus: int, codegen_workers: int) -> list[tuple[int, int]]:
+    ranks_per_worker, extra_ranks = divmod(runtime_ngpus, codegen_workers)
+    ranges = []
+    rank_start = 0
+    for worker_id in range(codegen_workers):
+        rank_end = rank_start + ranks_per_worker + (worker_id < extra_ranks)
+        ranges.append((rank_start, rank_end))
+        rank_start = rank_end
+    return ranges
+
+
+def _compile_flag_snapshot() -> dict[str, object]:
+    return {
+        name: value
+        for name, value in vars(CompileFlag).items()
+        if not name.startswith('__') and not callable(value)
+    }
+
+
+def _worker_log_text(worker_records: list[dict[str, Any]]) -> str:
+    log_sections = []
+    for record in worker_records:
+        log_file = record['log_file']
+        try:
+            log_text = log_file.read_text(encoding='utf-8', errors='replace')
+        except OSError as exc:
+            log_text = f'<failed to read worker log: {exc}>'
+        # Bound the exception size while retaining the traceback at the end of each log.
+        if len(log_text) > 64 * 1024:
+            log_text = '<log truncated>\n' + log_text[-64 * 1024:]
+        rank_start, rank_end = record['rank_range']
+        log_sections.append(
+            f"worker {record['worker_id']} ranks [{rank_start}, {rank_end}) "
+            f"exit code {record['process'].poll()}:\n{log_text}"
+        )
+    return '\n\n'.join(log_sections)
+
+
+def _terminate_codegen_workers(worker_records: list[dict[str, Any]]) -> None:
+    for record in worker_records:
+        process = record['process']
+        if process.poll() is None:
+            process.terminate()
+    for record in worker_records:
+        process = record['process']
+        if process.poll() is None:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+    for record in worker_records:
+        record['process'].wait()
+
+
+def _gencode_in_subprocesses(
+        module_codegen: ModuleCodeGen,
+        schedule_codegen: Optional[ScheduleCodeGen],
+        forward_args: Dict[str, Any],
+        compute_config: ComputeConfig,
+        outdir: Path,
+        codegen_workers: int,
+    ) -> None:
+    from nnscaler.graph.parser.register import CustomizedOps
+
+    rank_ranges = _partition_codegen_ranks(compute_config.runtime_ngpus, codegen_workers)
+    logger.info(
+        'Starting multi-process codegen for %d ranks with %d workers: %s',
+        compute_config.runtime_ngpus,
+        codegen_workers,
+        ', '.join(f'[{start}, {end})' for start, end in rank_ranges),
+    )
+    started_at = time.monotonic()
+    staging_dir = Path(tempfile.mkdtemp(prefix='.nnscaler-codegen-', dir=outdir))
+    payload_file = None
+    worker_records: list[dict[str, Any]] = []
+    try:
+        payload = {
+            'module_codegen': module_codegen,
+            'schedule_codegen': schedule_codegen,
+            'forward_args': forward_args,
+            'end2end_mode': compute_config.use_end2end,
+            'gencode_file_template': _GENCODE_FILE_TEMPLATE,
+            'compile_flags': _compile_flag_snapshot(),
+            'custom_op_emit_registry': dict(CustomizedOps.kOpEmit),
+        }
+        serialization_started = time.monotonic()
+        with tempfile.NamedTemporaryFile(prefix='nnscaler-codegen-', suffix='.pkl', delete=False) as stream:
+            payload_file = Path(stream.name)
+            serializer = dump_codegen_payload(payload, stream)
+            payload_bytes = stream.tell()
+        logger.info(
+            'Serialized codegen payload with %s: %.2f MiB in %.2f seconds',
+            serializer,
+            payload_bytes / (1024 * 1024),
+            time.monotonic() - serialization_started,
+        )
+
+        for worker_id, (rank_start, rank_end) in enumerate(rank_ranges):
+            log_file = staging_dir / f'worker{worker_id}.log'
+            log_stream = log_file.open('w', encoding='utf-8')
+            command = [
+                sys.executable,
+                '-m',
+                'nnscaler.codegen.worker',
+                '--payload',
+                str(payload_file),
+                '--outdir',
+                str(staging_dir),
+                '--rank-start',
+                str(rank_start),
+                '--rank-end',
+                str(rank_end),
+                '--worker-id',
+                str(worker_id),
+            ]
+            try:
+                process = subprocess.Popen(
+                    command,
+                    stdout=log_stream,
+                    stderr=subprocess.STDOUT,
+                    env={**os.environ, 'OMP_NUM_THREADS': '1',
+                         'MKL_NUM_THREADS': '1', 'OPENBLAS_NUM_THREADS': '1'},
+                )
+            except Exception:
+                log_stream.close()
+                raise
+            worker_records.append({
+                'worker_id': worker_id,
+                'rank_range': (rank_start, rank_end),
+                'process': process,
+                'log_file': log_file,
+                'log_stream': log_stream,
+                'started_at': time.monotonic(),
+            })
+
+        pending_worker_ids = set(range(codegen_workers))
+        failed_record = None
+        while pending_worker_ids and failed_record is None:
+            for worker_id in tuple(pending_worker_ids):
+                record = worker_records[worker_id]
+                return_code = record['process'].poll()
+                if return_code is None:
+                    continue
+                pending_worker_ids.remove(worker_id)
+                record['log_stream'].close()
+                if return_code != 0:
+                    failed_record = record
+                    break
+                rank_start, rank_end = record['rank_range']
+                logger.info(
+                    'Codegen worker %d completed ranks [%d, %d) in %.2f seconds',
+                    worker_id,
+                    rank_start,
+                    rank_end,
+                    time.monotonic() - record['started_at'],
+                )
+            if pending_worker_ids and failed_record is None:
+                time.sleep(0.05)
+
+        if failed_record is not None:
+            _terminate_codegen_workers(worker_records)
+            for record in worker_records:
+                if not record['log_stream'].closed:
+                    record['log_stream'].close()
+            raise _CodegenWorkerError(
+                f"Codegen worker {failed_record['worker_id']} failed; all worker logs follow:\n"
+                f'{_worker_log_text(worker_records)}'
+            )
+
+        missing_files = []
+        for rank in range(compute_config.runtime_ngpus):
+            filename = _GENCODE_FILE_TEMPLATE.format(rank)
+            if not (staging_dir / filename).is_file():
+                missing_files.append(filename)
+        for rank_start, rank_end in rank_ranges:
+            filename = worker_metadata_filename(rank_start, rank_end)
+            if not (staging_dir / filename).is_file():
+                missing_files.append(filename)
+        if missing_files:
+            raise _CodegenWorkerError(
+                f'Multi-process codegen did not produce expected files: {missing_files}; '
+                f'all worker logs follow:\n{_worker_log_text(worker_records)}'
+            )
+
+        metadata_started = time.monotonic()
+        variants = compact_worker_metadata(staging_dir, rank_ranges, compute_config.runtime_ngpus)
+        logger.info('Compacted %d worker metadata bundles covering %d ranks into %d unique variants in %.2f seconds',
+                    len(rank_ranges), compute_config.runtime_ngpus, variants, time.monotonic() - metadata_started)
+        _promote_codegen_outputs(staging_dir, outdir, compute_config.runtime_ngpus)
+        logger.info(
+            'Multi-process codegen completed %d ranks with %d workers in %.2f seconds',
+            compute_config.runtime_ngpus,
+            codegen_workers,
+            time.monotonic() - started_at,
+        )
+    except BaseException:
+        _terminate_codegen_workers(worker_records)
+        for record in worker_records:
+            if not record['log_stream'].closed:
+                record['log_stream'].close()
+        raise
+    finally:
+        if payload_file is not None:
+            payload_file.unlink(missing_ok=True)
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 def _load_parallel_module_class(
@@ -986,9 +1375,11 @@ def parallelize(
     module_dtype:  Optional[torch.dtype] = None,
     module_fn: Optional[Callable[[], torch.nn.Module]] = None,
     init_module_params: bool = True,
+    allow_missing_init_weights: bool = False,
     build_module_buckets: bool = True,
     broadcast_strategy: Union[str, BroadcastGenFilesStrategy] = 'none',
     autoset_requires_grad: bool = True,
+    codegen_workers: int = 1,
 ) -> Union[None, ParallelModule, Type[ParallelModule]]:
     """
     Convert a torch.nn.Module object or class to ParallelModule object or class.
@@ -1068,6 +1459,11 @@ def parallelize(
             so it is only used when module_or_module_class is a module object, and load_module is true.
             Please leave it to true until you have a good reason to change it.
         module_dtype (Optional[torch.dtype]): the dtype of the module. Keep the module as it is if it is None.
+        allow_missing_init_weights (bool): accept a resume-only generated package without
+            initial fullmodel.pt.<n> shards. Code, compute configuration, attribute metadata
+            and non-persistent buffers are still checked. The caller must construct the
+            generated class with init_params=False and restore its weights before use.
+            This does not skip initialization or relax checkpoint validation by itself.
         module_fn (Optional[Callable[[], torch.nn.Module]]): the function to create the module. Will use __init__ if it is None.
         broadcast_strategy (Union[str, BroadcastGenFilesStrategy]): the broadcast strategy for generated files.
             Please note that the broadcasting will only be done in torchrun environment,
@@ -1078,11 +1474,17 @@ def parallelize(
             If true, we will automatically set requires_grad according to compute_config and tensor dtypes.
             Note set requires_grad to True for end2end module is not useful,
             and this argument is mainly for non-end2end module.
+        codegen_workers (int): number of local subprocesses used for per-rank code generation.
+            The actual number is capped at ``compute_config.runtime_ngpus``. A value of 1 keeps
+            code generation in the current process.
     Returns:
         Union[ParallelModule, Type[ParallelModule], None]:
             if load_module flag is set, return the converted ParallelModule object or class
             if load_module flag is not set, return None
     """
+    if isinstance(codegen_workers, bool) or not isinstance(codegen_workers, int) or codegen_workers < 1:
+        raise ValueError(f'codegen_workers must be a positive integer, got {codegen_workers!r}')
+
     if (
         isinstance(module_or_module_class, ParallelModule) or
         (inspect.isclass(module_or_module_class) and issubclass(module_or_module_class, ParallelModule))
@@ -1122,7 +1524,9 @@ def parallelize(
         # generate code only in node0
         # if it is not in a torchrun environment, just generate.
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-            outdir, reusable = _prepare_and_check_reusable(gen_savedir, module_class, compute_config, instance_name, reuse)
+            outdir, reusable = _prepare_and_check_reusable(
+                gen_savedir, module_class, compute_config, instance_name, reuse,
+                allow_missing_init_weights=allow_missing_init_weights)
             if not reusable:
                 config_file = outdir / ParallelModule.COMPUTE_CONFIG_FILE
                 ComputeConfig.safe_dump_to_file(compute_config, config_file)  # always refresh compute config
@@ -1136,6 +1540,7 @@ def parallelize(
                         module_dtype=module_dtype,
                         module_fn=module_fn,
                         autoset_requires_grad=autoset_requires_grad,
+                        codegen_workers=codegen_workers,
                     )
             else:
                 regen_status = RegenStatus.NONE
@@ -1172,6 +1577,8 @@ def parallelize(
 
     # all nodes will raise an exception if the code generation is failed.
     if regen_status == RegenStatus.ERROR:
+        if isinstance(regen_exception, _CodegenWorkerError):
+            raise regen_exception
         raise RuntimeError("Code generation failed.") from regen_exception
 
     if broadcast_strategy != BroadcastGenFilesStrategy.NONE:
@@ -1284,6 +1691,25 @@ class OptimizerExtraState:
             self.non_parallel_extra_state = ExtraState(**self.non_parallel_extra_state)
 
 
+def _complete_vision_optimizer_locs(extra: OptimizerExtraState) -> None:
+    """Represent llm-train first-stage ViT's empty ranks explicitly.
+
+    The VL wrapper appends Vision after the language ParallelModule. Its
+    first-stage policy assigns Vision to range(vision_worker_size) per plan;
+    full-plan Vision already has optimizer locations on every worker.
+    """
+    for name, config in extra.parallel_module_configs.items():
+        workers = config.user_config.get('vision_worker_size')
+        if workers is None or workers == config.plan_ngpus or name in extra.parallel_module_locs:
+            continue
+        if not 0 < workers < config.plan_ngpus or extra.rank % config.plan_ngpus < workers:
+            raise ValueError(f"Missing optimizer parameters on an active Vision worker: {name}, rank {extra.rank}.")
+        if name != next(reversed(extra.parallel_module_configs)):
+            raise ValueError("First-stage Vision must be the last parallel module in the VL optimizer.")
+        end = max((loc.offset + loc.count for loc in extra.parallel_module_locs.values()), default=0)
+        extra.parallel_module_locs[name] = ModuleParameterLocation(end, 0)
+
+
 class ParallelOptimizer(torch.optim.Optimizer):
     """
     A optimizer stub to support parallelized module.
@@ -1393,6 +1819,15 @@ hybrid.is_hybrid = True  # mark this function as hybrid optimizer factory
 
 
 _NON_PARALLEL_MODULE_ATTR_NAME = '_nnscaler_non_parallel_module_'
+_SYNC_GRAD_REQUIRED_ATTR = '_nnscaler_sync_grad_required'
+# Keep optional identity metadata outside the strict OptimizerExtraState
+# schema: older readers ignore/copy unknown optimizer top-level keys.
+_OPTIMIZER_NON_PARALLEL_NAMES_KEY = '_nnscaler_non_parallel_param_names'
+
+
+def _mark_sync_grad_required(module: torch.nn.Module, inputs, output) -> None:
+    if module.training:
+        setattr(module, _SYNC_GRAD_REQUIRED_ATTR, True)
 
 
 def build_optimizer(
@@ -1486,8 +1921,14 @@ def build_optimizer(
     if isinstance(module, CubeModule) and not isinstance(module, ParallelModule):
         raise RuntimeError("Old style CubeModule is not supported")
 
-    # only the root module can be end2end module.
-    if any(m != module and isinstance(m, ParallelModule) and  m.compute_config.use_end2end for m in module.modules()):
+    # End-to-end submodules need an outer wrapper that delegates train_step and
+    # handles gradients crossing the submodule boundary explicitly.
+    nested_end2end = [
+        m for m in module.modules()
+        if m is not module and isinstance(m, ParallelModule)
+        and m.compute_config.use_end2end
+    ]
+    if nested_end2end and not getattr(module, 'supports_nested_end2end', False):
         raise RuntimeError("End2End module cannot be nested in another module")
 
     is_hybrid = getattr(optimizer_fn, 'is_hybrid', False)
@@ -1669,7 +2110,11 @@ def build_optimizer(
         )
     else:
         optimizer: torch.optim.Optimizer = optimizer_fn(_local_parameters(module), **kwargs)
+    if not isinstance(module, ParallelModule):
+        object.__setattr__(module, _SYNC_GRAD_REQUIRED_ATTR, False)
+        module.register_forward_hook(_mark_sync_grad_required)
     optimizer._non_parallel_module_reducer = non_parallel_module_reducer
+    optimizer._non_parallel_param_names = [param_original_names[p] for p in non_parallel_parameters]
     optimizer._extra_state = OptimizerExtraState(
             rank=torch.distributed.get_rank(),
             name=type(optimizer).__name__,
@@ -1682,6 +2127,8 @@ def build_optimizer(
                 list(non_parallel_parameter_locs.values())
                     if non_parallel_module_use_zero else None,
     )
+
+    _complete_vision_optimizer_locs(optimizer._extra_state)
 
     orig_step = optimizer.step
     def _patched_step(self, closure=None):
@@ -1726,23 +2173,33 @@ def build_optimizer(
     def _patched_state_dict(self):
         state_dict = orig_state_dict()
         state_dict[ParallelModule.EXTRA_STATE_KEY] = asdict(optimizer._extra_state)
+        if self._non_parallel_param_names:
+            state_dict[_OPTIMIZER_NON_PARALLEL_NAMES_KEY] = list(self._non_parallel_param_names)
         return state_dict
     optimizer.state_dict = types.MethodType(_patched_state_dict, optimizer)
 
     orig_load_state_dict = optimizer.load_state_dict
     def _patched_load_state_dict(self, state_dict):
         state_dict.pop(ParallelModule.EXTRA_STATE_KEY, None)
+        state_dict.pop(_OPTIMIZER_NON_PARALLEL_NAMES_KEY, None)
         orig_load_state_dict(state_dict)
     optimizer.load_state_dict = types.MethodType(_patched_load_state_dict, optimizer)
 
+    def _sync_grad_required():
+        if isinstance(module, ParallelModule):
+            return module._sync_grad_required
+        return getattr(module, _SYNC_GRAD_REQUIRED_ATTR, False)
+
+    def _reset_sync_grad_required():
+        if not isinstance(module, ParallelModule):
+            setattr(module, _SYNC_GRAD_REQUIRED_ATTR, False)
+
     def _sync_shard_grad(self):
         with _runtime_flags(skip_reducer=False):
-            # HACK: we reuse the _sync_grad_required flag of the first parallel module
-            # in order to support calling sync_shard_grad() multiple times.
-            # _sync_grad_required will reset to `True` in forward() of ParallelModule.
-            if parallel_modules[0]._sync_grad_required:
+            if _sync_grad_required():
+                _reset_sync_grad_required()  # reentrant safe
                 for m in parallel_modules:
-                    m.sync_grad()  # _sync_grad_required flag will reset inside sync_grad()
+                    m.sync_grad()
 
                 if non_parallel_module_reducer:
                     non_parallel_module_reducer.sync_grads()
@@ -1792,7 +2249,7 @@ def build_optimizer(
     optimizer.clip_gnorm = types.MethodType(_clip_gnorm, optimizer)
 
     def _scale_grads(self, scale: float) -> None:
-        if parallel_modules[0]._sync_grad_required:
+        if _sync_grad_required():
             raise RuntimeError("You can only call scale_grads() after gradients are synchronized.")
         for pg in optimizer.param_groups:
             for p in pg['params']:
@@ -1936,6 +2393,8 @@ def _get_optimizer_state_dict_info(
     ] = {}
     for opt_state_dict in optimizer_state_dicts:
         opt_extra_state = OptimizerExtraState(**opt_state_dict[ParallelModule.EXTRA_STATE_KEY])
+        # Also accept checkpoints saved before empty Vision locations were recorded.
+        _complete_vision_optimizer_locs(opt_extra_state)
         if not _is_supported_optimizer(opt_extra_state.name):
             raise ValueError("Only Adam-like or Muon-like optimizers are supported.")
         opt_extra_states[opt_extra_state.rank] = opt_extra_state
@@ -1948,17 +2407,16 @@ def _get_optimizer_state_dict_info(
             if opt_extra_state.rank < opt_dedup_group_size:
                 for i in range(loc.offset, loc.offset + loc.count):
                     # if the parameter is not used or requires_grad is False, it will not be in the state dict
-                    # for us, as we use a continous buffer, it will always have grad, so it will always be in the state dict
                     # the state for each parameters is inserted in Adam in a lazy way.
                     # see https://github.com/pytorch/pytorch/blob/dad1b765848c4f52501c4c60b1c3e6fbd3cc8837/torch/optim/adam.py#L103
-                    assert i in opt_state_dict['state']
-                    opt_state_dicts[module_prefix][opt_extra_state.rank]['state'][i - loc.offset] = opt_state_dict['state'][i]
+                    if i in opt_state_dict['state']:
+                        opt_state_dicts[module_prefix][opt_extra_state.rank]['state'][i - loc.offset] = opt_state_dict['state'][i]
                 # TODO: inaccurate param_groups, for example, the 'params' in it is not right.
                 # we have this to make `ParallelModule.merge_partial_states` happy.
                 opt_state_dicts[module_prefix][opt_extra_state.rank]['param_groups'] = copy.deepcopy(opt_state_dict['param_groups'])
 
         for k, v in opt_state_dict.items():
-            if k == ParallelModule.EXTRA_STATE_KEY or k == 'state':
+            if k in (ParallelModule.EXTRA_STATE_KEY, _OPTIMIZER_NON_PARALLEL_NAMES_KEY, 'state'):
                 continue
             # no further processing
             # here we assume values from all ranks are the same
@@ -2178,7 +2636,8 @@ def merge_state_dicts(
             npp_start = ret_states_cur_index - num_npp
             npp_states = {}
             for loc in range(npp_start, ret_states_cur_index):
-                npp_states[loc - npp_start] = ret_states.pop(loc)
+                if loc in ret_states:
+                    npp_states[loc - npp_start] = ret_states.pop(loc)
 
             # merge back npp_states to ret_states, the location is determined by non_parallel_param_locs
             ret_new_states = {}
@@ -2186,7 +2645,8 @@ def merge_state_dicts(
             for i in range(ret_states_cur_index):
                 if npp_inserted < len(npp_locs) and i == npp_locs[npp_inserted]:
                     # the position for non-parallel parameters
-                    ret_new_states[i] = npp_states[npp_inserted]
+                    if npp_inserted in npp_states:
+                        ret_new_states[i] = npp_states[npp_inserted]
                     npp_inserted += 1
                 elif i - npp_inserted in ret_states:
                     # as `npp_inserted` non-parallel parameters are inserted
@@ -2200,7 +2660,56 @@ def merge_state_dicts(
     return ret_state_dict, ret_opt_state_dict
 
 
+_merged_load_lock = threading.RLock()
+
+
+def _checkpoint_load_num_threads():
+    """Bound the restore pool by CPU affinity and visible cgroup-v2 quotas."""
+    cpus = (len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity')
+            else os.cpu_count() or 1)
+    root = Path('/sys/fs/cgroup')
+    directories = {root}
+    try:
+        for entry in Path('/proc/self/cgroup').read_text().splitlines():
+            if entry.startswith('0::'):
+                group = root / entry[3:].lstrip('/')
+                directories.update(p for p in (group, *group.parents)
+                                   if p.is_relative_to(root))
+    except OSError:
+        pass
+    # The mount root covers cgroup namespaces; ancestors can impose a tighter
+    # quota than the process's own group. Missing quotas leave affinity intact.
+    for directory in directories:
+        try:
+            quota, period = (directory / 'cpu.max').read_text().split()
+        except OSError:
+            continue
+        if quota != 'max':
+            cpus = min(cpus, max(1, int(quota) // int(period)))
+    local_ranks = max(1, int(os.environ.get('LOCAL_WORLD_SIZE', '1')))
+    return max(1, min(8, cpus // local_ranks))
+
+
+@contextmanager
+def _merged_load_cpu_threads():
+    # torchrun usually sets one CPU thread. Restoration benefits from a small
+    # pool, shared across this node's ranks; training keeps its original pool.
+    # Serialize restores within a process because set_num_threads is global.
+    with _merged_load_lock:
+        requested = _checkpoint_load_num_threads()
+        previous = torch.get_num_threads()
+        changed = requested != previous
+        if changed:
+            torch.set_num_threads(requested)
+        try:
+            yield
+        finally:
+            if changed:
+                torch.set_num_threads(previous)
+
+
 @torch.no_grad()
+@_merged_load_cpu_threads()
 def load_merged_state_dict(
     module: torch.nn.Module,
     module_state_dict: Dict[str, Any],
@@ -2230,12 +2739,17 @@ def load_merged_state_dict(
     # non ParallelModule parameters will be loaded here
     # there will be mismatched keys if the module is a ParallelModule or contains ParallelModule
     # so we need to ignore the mismatched keys
-    module.load_state_dict(module_state_dict, strict=False)
-    # load ParallelModule state dicts
-    for name, child_module in module.named_modules():
-        if isinstance(child_module, ParallelModule):
-            prefix = name + '.' if name else ''
-            child_module.load_merged_state_dict(module_state_dict, prefix=prefix)
+    parallel_modules = [
+        (name + '.' if name else '', child)
+        for name, child in module.named_modules() if isinstance(child, ParallelModule)
+    ]
+    # Keep the explicit pass for custom/legacy handlers that do not load merged
+    # parameters recursively. Completed loads are recorded only for this call;
+    # the explicit pass still checks missing keys without copying values twice.
+    with merged_load_session(module):
+        module.load_state_dict(module_state_dict, strict=False)
+        for prefix, child_module in parallel_modules:
+            load_merged_module(child_module, module_state_dict, prefix=prefix)
 
     if optimizer is not None and optimizer_state_dict is not None:
         new_optimizer_state_dict = _trim_optimizer_merged_state_dict(module, optimizer._extra_state, optimizer_state_dict, device='cpu')
@@ -2377,6 +2891,9 @@ def _opt_load_merged_state_dict(module: ParallelModule, states: Dict[int, Dict[s
                 orig_param_dict[name] = states[cnt]
             cnt = cnt + 1
 
+        if not orig_param_dict:
+            return {}
+
         if module.compute_config.use_zero == 1:
             return _construct_optim_state_zero(module, orig_param_dict)
         elif module.compute_config.use_zero > 1:
@@ -2391,7 +2908,7 @@ def _construct_optim_state_zero3(
 ):
     # state for each parameter in the parallel module
     new_states = _construct_optim_state_nonzero(module, orig_param_dict)
-    param_state_map = {p: new_states[idx] for idx, p in enumerate(module.parameters())}
+    param_state_map = {p: new_states[idx] for idx, p in enumerate(module.parameters()) if idx in new_states}
 
     state_dict, opt_param_idx = {}, 0
     opt_param = module.parameters_for_optimizer()
@@ -2401,11 +2918,23 @@ def _construct_optim_state_zero3(
             bucket: Bucket
             # one bucket corresponds to one flattened param
             assert len(opt_param[opt_param_idx].shape) == 1
+            state_presence = [param in param_state_map for param in bucket.params]
+            if not any(state_presence):
+                opt_param_idx += 1
+                continue
+            if not all(state_presence):
+                raise ValueError('Inconsistent optimizer state within one reducer bucket')
             chunk_size = bucket._contiguous_params.shape[0]
             opt_states = {}
             for param in bucket.params:
                 sliced_new_val = param_state_map[param]
                 offset = reducer.get_param_info(param).bucket_param_buffer_start
+                if opt_states:
+                    if opt_states.keys() != sliced_new_val.keys():
+                        raise ValueError('Inconsistent optimizer state keys within one reducer bucket')
+                    if 'step' in opt_states and not ParallelModule._safe_tensor_equal(
+                            opt_states['step'], sliced_new_val['step']):
+                        raise ValueError('Conflicting optimizer state step within one reducer bucket')
                 # init the optimizer state
                 if not opt_states:
                     for key in sliced_new_val.keys():
@@ -2431,10 +2960,50 @@ def _construct_optim_state_zero3(
         reducer_pids.update(id(p) for p in reducer.params)
     for param in module.parameters():
         if id(param) not in reducer_pids:
-            state_dict[opt_param_idx] = param_state_map[param]
+            if param in param_state_map:
+                state_dict[opt_param_idx] = param_state_map[param]
             opt_param_idx += 1
 
     return state_dict
+
+
+def _copy_optim_state_slice(destination: torch.Tensor, source: torch.Tensor,
+                           offset: int, val_chunks: int):
+    """Divide a logical flat slice into owned storage without flattening a copy."""
+    count = destination.numel()
+    if count == 0:
+        return
+    if offset == 0 and count == source.numel():
+        destination = destination.view(source.shape)
+    elif source.is_contiguous():
+        source = source.view(-1)[offset:offset + count]
+    else:
+        # Split a strided range into at most two partial edge rows and one
+        # complete middle block. All source slices remain views; recursion is
+        # needed only at the edges, not once for every row of a large tensor.
+        row_size = source.numel() // source.shape[0]
+        row, start = divmod(offset, row_size)
+        copied = 0
+        if start:
+            copied = min(row_size - start, count)
+            _copy_optim_state_slice(destination[:copied], source[row], start, val_chunks)
+            row += 1
+        rows, tail = divmod(count - copied, row_size)
+        if rows:
+            end = copied + rows * row_size
+            _copy_optim_state_slice(destination[copied:end], source[row:row + rows], 0, val_chunks)
+            copied = end
+        if tail:
+            _copy_optim_state_slice(destination[copied:], source[row + rows], 0, val_chunks)
+        return
+
+    # Keep the original division, including /1. A device/dtype conversion must
+    # happen after source arithmetic to preserve its rounding.
+    if (source.device == destination.device
+            and torch.result_type(source, 1.0) == destination.dtype):
+        torch.div(source, val_chunks, out=destination)
+    else:
+        destination.copy_(source / val_chunks)
 
 
 def _construct_optim_state_zero(
@@ -2449,110 +3018,70 @@ def _construct_optim_state_zero(
             key: original parameter name
             value: the state dict for each attribute, e.g. 'step', 'exp_avg', 'exp_avg_sq' are keys
     """
-    dist_param_map = module.dist_param_map  # name in parallel module (without tid suffix) -> name in origin module
-    param_area_map = module.fullmap         # str -> AttrMeta
-    def _get_optimizer_state_of_param(param, param_ids, local_names):
-        # find the parameter's optimizer state and pick the slices induced by tensor parallelism
-        param_idx = param_ids.index(id(param))
-        local_name = local_names[param_idx]
-        return _extract_new_state(local_name, orig_param_dict, dist_param_map, param_area_map)
-
-    # prepare param ids and corresponding local param names
-    param_ids, local_names = [], []
-    for local_name, param in module.named_parameters():
-        param_ids.append(id(param))
-        local_names.append(local_name)
+    # Resolve identity once instead of scanning all parameters for each bucket.
+    local_names = {id(param): name for name, param in module.named_parameters()}
     state_dict, opt_param_idx = {}, 0
     opt_param = module.parameters_for_optimizer()
-    # first load the params' optimizer state for the reducers's flattened params
     for reducer in module.reducers:
         rank_idx, sub_ranks = module._get_zero_subranks(reducer)
         for bucket in reducer.buckets:
-            # one bucket corresponds to one flattened param
             assert len(opt_param[opt_param_idx].shape) == 1
+            original_names = [module.dist_param_map[local_names[id(p)].rsplit('_', 1)[0]]
+                              for p in bucket.params]
+            state_presence = [bool(orig_param_dict.get(name)) for name in original_names]
+            if not any(state_presence):
+                opt_param_idx += 1
+                continue
+            if not all(state_presence):
+                raise ValueError('Inconsistent optimizer state within one reducer bucket')
             assert bucket._contiguous_params.shape[0] % len(sub_ranks) == 0
             chunk_size = bucket._contiguous_params.shape[0] // len(sub_ranks)
-            # the flattened param is in the range [bucket_chunk_start, bucket_chunk_end)
-            bucket_chunk_start = rank_idx * chunk_size
-            bucket_chunk_end = (rank_idx + 1) * chunk_size
-            # NOTE: assume the traverse order of params is consistent
-            # with them in contiguous buffer.
-            # param_offset: the param's start offset in the contiguous buffer
-            # chunk_offset: the offset of the current rank corresponding chunk
-            step, opt_states, opt_state_keys = None, {}, None
+            chunk_start = rank_idx * chunk_size
+            chunk_end = chunk_start + chunk_size
+            opt_states, state_keys, step = {}, None, None
             for param in bucket.params:
-                param_offset = reducer.get_param_info(param).bucket_param_buffer_start
-                sliced_new_val = _get_optimizer_state_of_param(param, param_ids, local_names)
-                # there are padding in the chunk, so `param.numel()` doesn't work here
-                param_numel = bucket.get_aligned_numel(param)
-                # init the chunk's optimizer state
-                if opt_state_keys is None:
-                    opt_state_keys = [key for key in sliced_new_val]
-                    if 'step' in sliced_new_val:
-                        step = sliced_new_val['step']
-                    if 'step' in sliced_new_val:
-                        opt_state_keys.remove('step')
-                    for key in opt_state_keys:
-                        opt_states[key] = torch.zeros([chunk_size], dtype=sliced_new_val[key].dtype,
-                                                        device='cpu', requires_grad=False)
-                # copy the param's slices to the optimizer's chunk
-                for key in opt_state_keys:
-                    sliced_new_val[key] = sliced_new_val[key].view(-1)
+                local_name = local_names[id(param)]
+                meta = module.fullmap[local_name]
+                original_name = module.dist_param_map[local_name.rsplit('_', 1)[0]]
+                source_state = orig_param_dict[original_name]
+                if state_keys is not None:
+                    if set(state_keys) != source_state.keys() - {'step'}:
+                        raise ValueError('Inconsistent optimizer state keys within one reducer bucket')
+                    if not ParallelModule._safe_tensor_equal(step, source_state.get('step')):
+                        raise ValueError('Conflicting optimizer state step within one reducer bucket')
+                if state_keys is None:
+                    state_keys = [key for key in source_state if key != 'step']
+                    step = source_state.get('step')
+                    for key in state_keys:
+                        # Match true division's dtype, including integer states.
+                        dtype = torch.result_type(source_state[key], 1.0)
+                        opt_states[key] = torch.zeros(chunk_size, dtype=dtype, device='cpu')
 
-                # parameter range: <>
-                # bucket range: []
-                # in the following branches, we check the range including paddings.
-                # but in branch body, we only copy the valid range (without paddings) but update the chunk_offset with paddings.
-                if param_offset < bucket_chunk_start \
-                    and bucket_chunk_start < param_offset + param_numel < bucket_chunk_end:
-                    # case: < [ > ]
-                    copy_size = param_offset + param_numel - bucket_chunk_start
-                    copy_size_without_padding = param_offset + param.numel() - bucket_chunk_start
-                    chunk_offset = 0
-                    if copy_size_without_padding > 0:
-                        for key in opt_state_keys:
-                            opt_states[key][chunk_offset:chunk_offset+copy_size_without_padding] = sliced_new_val[key][-copy_size_without_padding:]
-                elif bucket_chunk_start <= param_offset < bucket_chunk_end \
-                    and bucket_chunk_start <= param_offset + param_numel < bucket_chunk_end:
-                    # case: [ <  > ]
-                    chunk_offset = param_offset - bucket_chunk_start
-                    for key in opt_state_keys:
-                        opt_states[key][chunk_offset:chunk_offset+param.numel()] = sliced_new_val[key][:]
-                elif bucket_chunk_start <= param_offset < bucket_chunk_end \
-                    and param_offset + param_numel >= bucket_chunk_end:
-                    # case: [ < ] >
-                    copy_size = bucket_chunk_end - param_offset
-                    copy_size_without_padding = min(copy_size, param.numel())
-                    chunk_offset = param_offset - bucket_chunk_start
-                    for key in opt_state_keys:
-                        opt_states[key][chunk_offset:chunk_offset+copy_size_without_padding] = sliced_new_val[key][:copy_size_without_padding]
-                elif param_offset < bucket_chunk_start \
-                    and param_offset + param_numel >= bucket_chunk_end:
-                    # case: < [ ] >
-                    copy_size = bucket_chunk_end - bucket_chunk_start
-                    copy_size_without_padding = min(copy_size, param_offset + param.numel() - bucket_chunk_start)
-                    chunk_offset = 0
-                    if copy_size_without_padding > 0:
-                        for key in opt_state_keys:
-                            opt_states[key][chunk_offset:chunk_offset + copy_size_without_padding] \
-                                = sliced_new_val[key][bucket_chunk_start-param_offset:bucket_chunk_start-param_offset + copy_size_without_padding]
-                else:
-                    # case: [] <>, <> []
-                    logger.debug(f'Skipped: parameter range({param_offset},{param_offset + param_numel}) vs. bucket range({bucket_chunk_start},{bucket_chunk_end})')
+                param_start = reducer.get_param_info(param).bucket_param_buffer_start
+                # Intersect only real parameter data. Padding stays zero, even
+                # when this rank's chunk starts or ends entirely inside padding.
+                start = max(param_start, chunk_start)
+                end = min(param_start + param.numel(), chunk_end)
+                if start >= end:
+                    continue
+                for key in state_keys:
+                    source = source_state[key][meta.slicers]
+                    destination = opt_states[key][start - chunk_start:end - chunk_start]
+                    _copy_optim_state_slice(destination, source, start - param_start, meta.val_chunks)
 
+            # Preserve the original field order as well as its values.
             if step is not None:
                 opt_states['step'] = step
             state_dict[opt_param_idx] = opt_states
             opt_param_idx += 1
-    # load the params' optimizer state that are not in reducers
-    # this part corresponds to nnscaler/runtime/module.py: parameters_for_optimizer
-    reducer_pids = set()
-    for reducer in module.reducers:
-        reducer_pids.update(id(p) for p in reducer.params)
+
+    reducer_pids = {id(param) for reducer in module.reducers for param in reducer.params}
     for param in module.parameters():
         if id(param) not in reducer_pids:
-            sliced_new_val = _get_optimizer_state_of_param(param, param_ids, local_names)
-            state_dict[opt_param_idx] = sliced_new_val
+            state = _extract_new_state(
+                local_names[id(param)], orig_param_dict, module.dist_param_map, module.fullmap)
+            if state is not None:
+                state_dict[opt_param_idx] = state
             opt_param_idx += 1
     return state_dict
 
@@ -2566,10 +3095,19 @@ def _construct_optim_state_nonzero(
 
     new_states: dict[int, dict[str, torch.Tensor]] = {}
     for index, (local_name, _) in enumerate(module.named_parameters()):
-        new_states[index] = _extract_new_state(
+        state = _extract_new_state(
             local_name, orig_param_dict, dist_param_map, param_area_map,
             module.get_zero3_attr_meta(local_name)
         )
+        if state is not None:
+            new_states[index] = state
+
+    state_presence = {param: index in new_states for index, param in enumerate(module.parameters())}
+    for reducer in module.reducers:
+        for bucket in reducer.buckets:
+            present = [state_presence[param] for param in bucket.params]
+            if any(present) and not all(present):
+                raise ValueError('Inconsistent optimizer state within one reducer bucket')
 
     return new_states
 
@@ -2580,11 +3118,13 @@ def _extract_new_state(
         dist_param_map: Dict[str, str],
         param_area_map: Dict[str, AttrMeta],
         zero3_info: Optional[Zero3AttrMeta] = None
-) -> Dict[str, torch.Tensor]:
+) -> Optional[Dict[str, torch.Tensor]]:
     name = '_'.join(local_name.split('_')[:-1]) # remove the integer suffix
     assert name in dist_param_map
     attr_meta = param_area_map[local_name]
-    new_val = orig_param_dict[dist_param_map[name]]
+    new_val = orig_param_dict.get(dist_param_map[name])
+    if not new_val:
+        return None
     sliced_new_val = {}
     for key in new_val:
         if key in ('step',):
@@ -2665,8 +3205,11 @@ def _broadcast_gen_files(
             if file.is_file() and (
                 broadcast_strategy == BroadcastGenFilesStrategy.ALL or
                 (
+                    # NO_WEIGHTS excludes both fullmodel.pt.* and npbuffer.pt.
+                    # Non-persistent buffers will be initialized via `broadcast_weights`.
                     broadcast_strategy == BroadcastGenFilesStrategy.NO_WEIGHTS
                     and not file.name.startswith(FxModuleParser.ATTR_CONTENT_FILE_STEM)
+                    and file.name != FxModuleParser.NON_PERSISTENT_BUFFER_FILE
                 ) or
                 (
                     # broadcast code files and compute config file
@@ -2701,6 +3244,8 @@ def _broadcast_gen_files(
 
     # wait for all nodes to finish
     torch.distributed.barrier()
+
+    logger.info('Files broadcasted.')
 
 
 def _collect_dedup_info(parallel_modules: Dict[str, ParallelModule]) -> Tuple[
@@ -2836,6 +3381,14 @@ def load_deduped_state_dict(
     Returns:
         None
     """
+    if optimizer is not None and optimizer_state_dict is not None and not isinstance(
+            getattr(optimizer, '_extra_state', None), OptimizerExtraState):
+        raise ValueError('Deduped optimizer loading requires build_optimizer layout metadata')
+    module_state_dict = align_state_dict_names(
+        module, module_state_dict, optimizer=optimizer, optimizer_state_dict=optimizer_state_dict,
+    )
+    if optimizer_state_dict is not None:
+        optimizer_state_dict = _copy_optimizer_state_metadata(optimizer_state_dict)
     device = device or torch.cuda.current_device()
     cur_rank = torch.distributed.get_rank()
 
@@ -2873,25 +3426,33 @@ def load_deduped_state_dict(
                     local_name2ranks[key].append(rank)
 
         # create process groups for broadcasting
+        broadcast_groups = []
         for key, ranks in local_name2ranks.items():
             if len(ranks) <= 1:
                 continue
             # should have sorted.
             ranks.sort()
             logger.debug(f'At rank {cur_rank}, create groups for ranks: {ranks}.')
-            DeviceGroup().get_group(ranks)
+            broadcast_groups.append(ranks)
+        DeviceGroup().get_groups(broadcast_groups)
 
         torch.distributed.barrier()
 
-        # broadcast weights in parallel modules inside dedup group (most time it is the 1st scale unit)
-        # Implementation of `deduped_state_dict` can guarantee that the first rank in each rank group always has the weights
+        # Restore one membership at a time in a deterministic global order.
+        # Only members synchronize between batches; nonmembers no longer enter
+        # a world barrier for every individual parameter. The world barrier at
+        # the end of this phase still precedes cross-scale-unit propagation.
+        group_keys = defaultdict(list)
         for key_name, ranks in local_name2ranks.items():
             if len(ranks) <= 1:
                 continue
-            prefix, local_name = key_name
-            if cur_rank in ranks:
+            group_keys[tuple(ranks)].append(key_name)
+        for ranks, keys in sorted(group_keys.items()):
+            if cur_rank not in ranks:
+                continue
+            broadcast_group = DeviceGroup().get_group(ranks)
+            for prefix, local_name in keys:
                 key = f'{prefix}.{local_name}' if prefix else local_name
-                broadcast_group = DeviceGroup().get_group(ranks)
                 assert prefix in no_zero3_pms, f'Prefix {prefix} not found in parallel_modules: {list(no_zero3_pms.keys())}.'
                 pm = no_zero3_pms[prefix]
                 assert hasattr(pm, local_name), f'Local name {local_name} not found in {pm}.'
@@ -2923,7 +3484,7 @@ def load_deduped_state_dict(
                                 f'At rank {cur_rank}, the attribute {key} is already loaded, ' \
                                 f'but not equal to the broadcasted tensor from rank {ranks[0]}.'
 
-            torch.distributed.barrier()
+            torch.distributed.barrier(group=broadcast_group)
 
         for key in missing_keys:
             split_names = key.split('.')
@@ -2984,7 +3545,11 @@ def _broadcast_opt_state(optimizer_state_dict: OptStateDict, state_indexes: List
     if rank == src_rank:
         state_info = {}
         for idx in state_indexes:
-            state_info[idx] = {key: (value.shape, value.dtype) for key, value in optimizer_state_dict['state'][idx].items()}
+            if idx in optimizer_state_dict['state']:
+                state_info[idx] = {
+                    key: (value.shape, value.dtype)
+                    for key, value in optimizer_state_dict['state'][idx].items()
+                }
         sent = [state_info]
     else:
         sent = [None]
@@ -2993,58 +3558,43 @@ def _broadcast_opt_state(optimizer_state_dict: OptStateDict, state_indexes: List
             src=src_rank,
             group=curr_parallel_group,
     )
-    if rank != src_rank:
-        for k, v in sent[0].items():
-            optimizer_state_dict['state'][k] = {
-                key: torch.zeros(value[0], dtype=value[1], device=torch.cuda.current_device())
-                for key, value in v.items()
-            }
-    else:
-        for idx in state_indexes:
-           for key, value in optimizer_state_dict['state'][idx].items():
-               optimizer_state_dict['state'][idx][key] = optimizer_state_dict['state'][idx][key].cuda()
-
-    # broadcast step
-    # step is too small, so we can just broadcast all of them all together
-    # some adam/adamw optimizers may not have step in their state dict
-    # so we need to check if 'step' is in the state dict
-    step_state_indexes = [k for k in state_indexes if 'step' in optimizer_state_dict['state'][k]]
-    if step_state_indexes:
-        assert all(
-            optimizer_state_dict['state'][k]['step'].dtype ==
-            optimizer_state_dict['state'][step_state_indexes[0]]['step'].dtype and
-            optimizer_state_dict['state'][k]['step'].shape ==
-            optimizer_state_dict['state'][step_state_indexes[0]]['step'].shape
-            for k in step_state_indexes
+    # Preserve checkpoint dictionary order: optimizer state restoration and
+    # subsequent allocation order must not change just to pipeline transfers.
+    entries = [(idx, key, shape, dtype)
+               for idx, fields in sent[0].items()
+               for key, (shape, dtype) in fields.items() if key != 'step']
+    step_indices = [idx for idx, fields in sent[0].items() if 'step' in fields]
+    step_values = {}
+    device = torch.device('cuda', torch.cuda.current_device())
+    if step_indices:
+        shape, dtype = sent[0][step_indices[0]]['step']
+        if any(sent[0][idx]['step'] != (shape, dtype) for idx in step_indices):
+            raise ValueError('Optimizer step tensors must have matching shapes and dtypes')
+        stacked = (torch.stack([optimizer_state_dict['state'][idx]['step'].to(device)
+                                for idx in step_indices]) if rank == src_rank else None)
+        step_stack, = broadcast_checkpoint_tensors(
+            [stacked] if stacked is not None else None,
+            [(tuple([len(step_indices), *shape]), dtype)],
+            src=src_rank, group=curr_parallel_group, device=device,
         )
-        if rank == src_rank:
-            step_stack = torch.stack(
-                [optimizer_state_dict['state'][k]['step'] for k in step_state_indexes]
-            )
-        else:
-            step_stack = torch.zeros(
-                len(step_state_indexes),
-                dtype=optimizer_state_dict['state'][step_state_indexes[0]]['step'].dtype,
-                device=torch.cuda.current_device()
-            )
-        torch.distributed.broadcast(step_stack, src=src_rank, group=curr_parallel_group)
-        if rank != src_rank:
-            for k, v in zip(step_state_indexes, step_stack):
-                optimizer_state_dict['state'][k]['step'].copy_(v)
+        step_values = {idx: value.clone() for idx, value in zip(step_indices, step_stack)}
+    values = ([optimizer_state_dict['state'][idx][key] for idx, key, _, _ in entries]
+              if rank == src_rank else None)
+    restored = broadcast_checkpoint_tensors(
+        values, [(shape, dtype) for _, _, shape, dtype in entries],
+        src=src_rank, group=curr_parallel_group,
+        device=device,
+    )
+    values_by_key = {(idx, key): value for (idx, key, _, _), value in zip(entries, restored)}
+    for idx, fields in sent[0].items():
+        optimizer_state_dict['state'][idx] = {
+            key: step_values[idx] if key == 'step' else values_by_key[idx, key]
+            for key in fields
+        }
 
-    # broadcast other states
-    # TODO: can be slow?
-    for k in state_indexes:
-        keys = sorted(optimizer_state_dict['state'][k].keys())
-        # for mixed precision f16 optimizer, we will add custom keys
-        # assert set(keys) == {'step', 'exp_avg', 'exp_avg_sq'}
-        if 'step' in keys:
-            keys.remove('step')  # we have done step in previous.
-        for key in keys:
-            value = optimizer_state_dict['state'][k][key]
-            torch.distributed.broadcast(value.data, src=src_rank, group=curr_parallel_group)
-
-    torch.distributed.barrier()
+    # Partial-ownership modules (first-stage ViT) are absent on other PP ranks.
+    # Only the ranks participating in this broadcast must synchronize here.
+    torch.distributed.barrier(group=curr_parallel_group)
 
 
 def broadcast_weights(module: torch.nn.Module, stride_size: Optional[int] = None):
@@ -3103,6 +3653,273 @@ def _broadcast_weights(module: torch.nn.Module, stride_size: int):
 
 
 @torch.no_grad()
+def align_state_dict_names(
+    module: torch.nn.Module,
+    module_state_dict: Dict[str, Any],
+    *,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    optimizer_state_dict: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Align generated ParallelModule parameter/buffer names in a per-rank checkpoint.
+
+    Match by original name and shard metadata, ignoring generated names and tensor
+    IDs. Return a shallow copy without copying tensors or modifying the input.
+    Module prefixes, original names, partitioning and optimizer parameter order
+    must be unchanged. Missing metadata or ambiguous/incompatible matches raise
+    ValueError. This adapter is for sharded/deduped, not merged, state dicts.
+    When restoring an optimizer, also validate its global module locations or
+    saved param_names before loading any weights. Model key order is not an
+    optimizer ordering contract.
+    """
+    def attr_meta_identity(meta: AttrMeta) -> tuple:
+        key = asdict(meta)
+        # Remove tensor ID from the key as it is not used for identity
+        key.pop('tid', None)
+        # slice is not hashable in old versions of Python
+        key['slicers'] = tuple((s.start, s.stop, s.step) for s in meta.slicers)
+        return tuple(key.values())
+
+    def zero3_attr_meta_identity(meta: Union[Zero3AttrMeta, dict]) -> tuple:
+        # Keep vl_pp metadata storage unchanged; accept both persisted forms.
+        key = asdict(Zero3AttrMeta(**meta)) if isinstance(meta, dict) else asdict(meta)
+        key.pop('attr_name', None)
+        return tuple(key.values())
+
+    key_map: Dict[str, str] = {}
+    extra_states: Dict[str, Any] = {}
+    for prefix, pm in module.named_modules():
+        if not isinstance(pm, ParallelModule):
+            continue
+        prefix = f'{prefix}.' if prefix else ''
+        extra_key = f'{prefix}{ParallelModule.EXTRA_STATE_KEY}'
+        if extra_key not in module_state_dict:
+            raise ValueError(f"Cannot align checkpoint names: missing {extra_key}")
+        old = ExtraState(**module_state_dict[extra_key])
+        current_state: Dict[str, Any] = {}
+        pm._add_extra_state(current_state, prefix)
+        current = ExtraState(**current_state[extra_key])
+
+        if old.rank != current.rank:
+            raise ValueError(f"Cannot align {extra_key}: checkpoint rank changed")
+
+        for field_name in ('plan_ngpus', 'runtime_ngpus', 'use_zero', 'zero_ngroups'):
+            if getattr(old.compute_config, field_name) != getattr(current.compute_config, field_name):
+                raise ValueError(f"Cannot align {extra_key}: {field_name} changed; load a merged checkpoint instead")
+
+        for field_name in ('origin_param_names', 'origin_state_dict_names', 'origin_shared_param_names'):
+            if getattr(old, field_name) != getattr(current, field_name):
+                raise ValueError(f"Cannot align {extra_key}: original model metadata {field_name} changed; load a merged checkpoint instead")
+
+        candidates: Dict[tuple, str] = {
+            attr_meta_identity(meta): name
+            for name, meta in current.param_area_map.items()
+        }
+        if len(candidates) != len(current.param_area_map):
+            raise ValueError(f"Cannot align {extra_key}: ambiguous shard metadata in module param_area_map")
+
+        # Map old parameter names to new parameter names
+        name_map: Dict[str, str] = {}
+
+        for old_name, meta in old.param_area_map.items():
+            # Consume each match once to keep the old and new shard names in one-to-one correspondence.
+            match = candidates.pop(attr_meta_identity(meta), None)
+            if match is None:
+                raise ValueError(
+                    f"Cannot align {prefix}{old_name}: expected one match for "
+                    f"{meta.orig_name} with the same shard metadata, found {match}"
+                )
+            name_map[old_name] = match
+
+        if candidates:
+            raise ValueError(f"Cannot align {extra_key}: parameter names are missing from shard metadata")
+
+        # Optimizer state uses positional IDs (or bucket offsets), not model keys.
+        if any(name not in name_map for name in old.cube_param_names):
+            raise ValueError(f"Cannot align {extra_key}: optimizer parameter names are missing from shard metadata")
+        if [name_map[name] for name in old.cube_param_names] != current.cube_param_names:
+            raise ValueError(f"Cannot align {extra_key}: optimizer parameter order changed")
+        for field_name in ('zero', 'model_idx2opt_idx', 'opt_idx2ranks'):
+            if getattr(old, field_name) != getattr(current, field_name):
+                raise ValueError(f"Cannot align {extra_key}: optimizer layout {field_name} changed")
+
+        # zero3 config
+        if any(name not in name_map for name, meta in (old.zero3_param_metadata or {}).items() if meta is not None):
+            raise ValueError(f'Cannot align {extra_key}: ZeRO-3 names are missing from shard metadata')
+        old_zero3 = {
+            name_map[name]: zero3_attr_meta_identity(meta)
+            for name, meta in old.zero3_param_metadata.items() if meta is not None
+        } if old.zero3_param_metadata else {}
+        new_zero3 = {
+            name: zero3_attr_meta_identity(meta)
+            for name, meta in current.zero3_param_metadata.items() if meta is not None
+        } if current.zero3_param_metadata else {}
+        if old_zero3 != new_zero3:
+            raise ValueError(f"Cannot align {extra_key}: ZeRO-3 parameter layout changed")
+
+        for name, meta in old.param_area_map.items():
+            # Deduped checkpoints legitimately omit tensors, but any payload
+            # that is present must agree with the metadata being aligned.
+            if f'{prefix}{name}' not in module_state_dict:
+                continue
+            value = module_state_dict[f'{prefix}{name}']
+            zero3_meta = (old.zero3_param_metadata or {}).get(name)
+            if isinstance(zero3_meta, dict):
+                zero3_meta = Zero3AttrMeta(**zero3_meta)
+            expected_shape = (zero3_meta.chunk_size,) if zero3_meta is not None else tuple(meta.sub_shape)
+            if not isinstance(value, torch.Tensor) or value.dtype != meta.dtype or tuple(value.shape) != expected_shape:
+                raise ValueError(f'Cannot align {prefix}{name}: tensor dtype or shape does not match shard metadata')
+
+        key_map.update({f'{prefix}{old_name}': f'{prefix}{new_name}' for old_name, new_name in name_map.items()})
+        extra_states[extra_key] = current_state[extra_key]
+
+    if optimizer is not None and optimizer_state_dict is not None and extra_states:
+        _validate_optimizer_checkpoint_layout(module, optimizer, optimizer_state_dict, key_map)
+
+    # create a new adapted state dict with the same type of original state dict
+    # And this can also keep the `_metadata` attached to the dict if it exists
+    adapted = copy.copy(module_state_dict)
+    adapted.clear()
+    for key, value in module_state_dict.items():
+        new_key = key_map.get(key, key)
+        if new_key in adapted:
+            raise ValueError(f"Cannot align checkpoint names: key collision at {new_key}")
+        adapted[new_key] = extra_states.get(key, value)
+    logger.info("Aligned %s checkpoint parameter/buffer names", sum(k != v for k, v in key_map.items()))
+    return adapted
+
+
+def _validate_optimizer_checkpoint_layout(module, optimizer, state_dict, name_map):
+    """Validate positional optimizer IDs independently of model dictionary order."""
+    current = getattr(optimizer, '_extra_state', None)
+    if isinstance(current, OptimizerExtraState):
+        metadata = state_dict.get(ParallelModule.EXTRA_STATE_KEY)
+        if metadata is None:
+            raise ValueError('Cannot verify optimizer parameter order: checkpoint is missing optimizer layout metadata')
+        old = OptimizerExtraState(**metadata)
+        for field in ('rank', 'name', 'parallel_module_locs', 'non_parallel_param_locs'):
+            if getattr(old, field) != getattr(current, field):
+                raise ValueError(f'Cannot load optimizer: global parameter layout {field} changed')
+        if old.parallel_module_configs.keys() != current.parallel_module_configs.keys():
+            raise ValueError('Cannot load optimizer: parallel module locations changed')
+        old_nonparallel = old.non_parallel_extra_state
+        current_nonparallel = current.non_parallel_extra_state
+        if (old_nonparallel is None) != (current_nonparallel is None):
+            raise ValueError('Cannot load optimizer: non-parallel reducer layout changed')
+        if old_nonparallel is not None:
+            for field in ('zero', 'model_idx2opt_idx', 'opt_idx2ranks', 'cube_param_names',
+                          'origin_param_names', 'origin_shared_param_names'):
+                if getattr(old_nonparallel, field) != getattr(current_nonparallel, field):
+                    raise ValueError(f'Cannot load optimizer: non-parallel reducer layout {field} changed')
+            old_map = {name: replace(meta, tid=0) for name, meta in old_nonparallel.param_area_map.items()}
+            current_map = {name: replace(meta, tid=0) for name, meta in current_nonparallel.param_area_map.items()}
+            if old_map != current_map:
+                raise ValueError('Cannot load optimizer: non-parallel reducer shard layout changed')
+        old_names = state_dict.get(_OPTIMIZER_NON_PARALLEL_NAMES_KEY)
+        if old_names is None and old.non_parallel_extra_state is not None:
+            old_names = old.non_parallel_extra_state.origin_param_names
+        current_names = getattr(optimizer, '_non_parallel_param_names', None)
+        if current_names is None and current.non_parallel_extra_state is not None:
+            current_names = current.non_parallel_extra_state.origin_param_names
+        if old_names is None:
+            if current_names:
+                raise ValueError('Cannot verify optimizer parameter order for legacy non-parallel parameters; '
+                                 'load a merged checkpoint instead')
+            old_names = []
+        if old_names != (current_names or []):
+            raise ValueError('Cannot load optimizer: non-parallel parameter order changed')
+        current_groups = optimizer.state_dict()['param_groups']
+        saved_groups = state_dict['param_groups']
+        if ([group['params'] for group in saved_groups]
+                != [group['params'] for group in current_groups]):
+            raise ValueError('Cannot load optimizer: positional parameter-group layout changed')
+        for saved, current_group in zip(saved_groups, current_groups):
+            if 'children' in saved or 'children' in current_group:
+                if _hybrid_optimizer_group_layout(saved) != _hybrid_optimizer_group_layout(current_group):
+                    raise ValueError('Cannot load optimizer: Hybrid parameter-group layout changed')
+        return
+
+    # Raw PyTorch optimizer IDs have no parameter identity. A model state_dict
+    # may be reordered, and its order need not match optimizer construction.
+    # Require explicit saved names rather than guessing which momentum belongs
+    # to a parameter. Names map through the same checked shard-name alignment.
+    aliases = defaultdict(set)
+    for name, param in module.named_parameters(remove_duplicate=False):
+        aliases[id(param)].add(name)
+    saved_groups = state_dict.get('param_groups', [])
+    if len(saved_groups) != len(optimizer.param_groups):
+        raise ValueError('Cannot load optimizer: parameter-group layout changed')
+    for saved, current_group in zip(saved_groups, optimizer.param_groups):
+        names = saved.get('param_names')
+        if names is None:
+            raise ValueError('Cannot verify raw optimizer parameter order without saved param_names; '
+                             'use build_optimizer or a checkpoint with explicit parameter names')
+        if len(names) != len(saved['params']) or len(names) != len(current_group['params']):
+            raise ValueError('Cannot load optimizer: named parameter-group layout changed')
+        for name, param in zip(names, current_group['params']):
+            if not isinstance(name, str):
+                raise ValueError('Cannot verify raw optimizer parameter order: param_names must be strings')
+            if name_map.get(name, name) not in aliases[id(param)]:
+                raise ValueError('Cannot load optimizer: global named parameter order changed')
+
+
+def _copy_optimizer_state_metadata(state_dict, module=None, optimizer=None):
+    # The wrapped optimizer removes its extra state on load; hybrid optimizers
+    # also replace nested param-group IDs. Preserve caller-owned metadata while
+    # retaining tensor storage and bounded restore memory.
+    result = copy.copy(state_dict)
+    result['param_groups'] = copy.deepcopy(state_dict['param_groups'])
+    result['state'] = {index: copy.copy(state) for index, state in state_dict['state'].items()}
+    if module is not None and optimizer is not None and not isinstance(
+            getattr(optimizer, '_extra_state', None), OptimizerExtraState):
+        names = {id(param): name for name, param in module.named_parameters()}
+        for saved, current in zip(result['param_groups'], optimizer.param_groups):
+            if 'param_names' in saved:
+                # Subsequent raw-optimizer saves must refer to the newly
+                # generated names rather than stale checkpoint tensor IDs.
+                saved['param_names'] = [names[id(param)] for param in current['params']]
+    return result
+
+
+def _hybrid_optimizer_group_layout(group):
+    return (group.get('param_map'), group.get('reverse_param_map'),
+            {index: [child.get('params') for child in children]
+             for index, children in group.get('children', {}).items()})
+
+
+def _finalize_sharded_optimizer_state_dict(optimizer, state_dict):
+    """Record the destination layout after a trusted merged-to-sharded conversion.
+
+    Call only at conversion writers, after trimming by the destination module's
+    metadata. Ordinary sharded loaders must validate the saved identity instead
+    of regenerating it from whichever optimizer is loading the checkpoint.
+    """
+    result = _copy_optimizer_state_metadata(state_dict)
+    current = optimizer.state_dict()
+    if ([group['params'] for group in result['param_groups']]
+            != [group['params'] for group in current['param_groups']]):
+        raise ValueError('Trimmed optimizer does not match the destination parameter layout')
+    for saved, target in zip(result['param_groups'], current['param_groups']):
+        if 'children' in target:
+            if (saved.get('children', {}).keys() != target['children'].keys()
+                    or any(len(saved['children'][index]) != len(children)
+                           for index, children in target['children'].items())):
+                raise ValueError('Cannot redistribute a different Hybrid optimizer group structure')
+            # Keep saved options (learning rate, decay, etc.), while recording
+            # the new local parameter/bucket membership used by Hybrid's loader.
+            for index, children in target['children'].items():
+                for source_child, target_child in zip(saved['children'][index], children):
+                    source_child['params'] = list(target_child['params'])
+            for key in ('param_map', 'reverse_param_map'):
+                saved[key] = copy.deepcopy(target[key])
+    result[ParallelModule.EXTRA_STATE_KEY] = asdict(optimizer._extra_state)
+    result.pop(_OPTIMIZER_NON_PARALLEL_NAMES_KEY, None)
+    if optimizer._non_parallel_param_names:
+        result[_OPTIMIZER_NON_PARALLEL_NAMES_KEY] = list(optimizer._non_parallel_param_names)
+    return result
+
+
+@torch.no_grad()
 def load_sharded_state_dict(
     module: torch.nn.Module,
     module_state_dict: Dict[str, Any],
@@ -3125,13 +3942,16 @@ def load_sharded_state_dict(
     Returns:
         None
     """
+    module_state_dict = align_state_dict_names(
+        module, module_state_dict, optimizer=optimizer, optimizer_state_dict=optimizer_state_dict,
+    )
 
     device = device or torch.cuda.current_device()
     module.to(device)
 
     module.load_state_dict(module_state_dict)
     if optimizer and optimizer_state_dict:
-        optimizer.load_state_dict(optimizer_state_dict)
+        optimizer.load_state_dict(_copy_optimizer_state_metadata(optimizer_state_dict, module, optimizer))
 
 
 def sync_grad_when(cond: bool):
@@ -3421,6 +4241,8 @@ def trimmed_broadcast_merged_state_dict(
     device = device or torch.cuda.current_device()
     world_size = torch.distributed.get_world_size()
     dst_ranks = dst_ranks or list(range(world_size))
+    if dst_ranks != sorted(set(dst_ranks)):
+        raise ValueError(f"Invalid destination ranks: {dst_ranks}. They must be unique and sorted.")
     cur_rank = torch.distributed.get_rank()
 
     if cur_rank not in dst_ranks or src_rank not in dst_ranks:
@@ -3530,6 +4352,8 @@ def trimmed_broadcast_merged_state_dict(
         prefix = module_path + '.' if module_path else ''
         if isinstance(m, ParallelModule):
             m._add_extra_state(ret[0], prefix)
+    if ret[1] is not None:
+        ret = ret[0], _finalize_sharded_optimizer_state_dict(optimizer, ret[1])
     return ret
 
 

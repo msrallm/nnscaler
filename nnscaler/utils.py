@@ -30,6 +30,34 @@ import torch
 _logger = logging.getLogger(__name__)
 
 
+def run_on_rank0(fn: Callable[[], Any]) -> Any:
+    """Run a metadata operation once and share its result or failure.
+
+    All ranks of the initialized default group must call this in the same
+    order. Outside distributed execution, call ``fn`` directly. Intended for
+    small, picklable metadata, never tensor checkpoint payloads. This does not
+    cache across invocations, so a later resume sees newly published files.
+    """
+    dist = torch.distributed
+    if not dist.is_available() or not dist.is_initialized():
+        return fn()
+    outcome = [None]
+    if dist.get_rank() == 0:
+        try:
+            value = fn()
+            # Detect unpicklable results before peers enter their receive.
+            import pickle
+            pickle.dumps(value)
+            outcome[0] = (True, value)
+        except Exception as exc:
+            outcome[0] = (False, f'{type(exc).__name__}: {exc}')
+    dist.broadcast_object_list(outcome, src=0)
+    success, value = outcome[0]
+    if not success:
+        raise RuntimeError(f'Rank 0 metadata operation failed: {value}')
+    return value
+
+
 def print_each_rank(msg: str, rank_only: Optional[int] = None, logger: Optional[logging.Logger] = None):
     """Logging the message.
 
@@ -171,14 +199,9 @@ def setup_stride_broadcast_group(stride_size: int) -> BroadcastGroup:
     Returns:
         BroadcastGroup: the source rank and the broadcast group.
     """
-    rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
-    for i in range(stride_size):
-        ranks = list(range(i, world_size, stride_size))
-        nnscaler.runtime.device.DeviceGroup().get_group(ranks)
-
-    curr_parallel_group_ranks = list(range(rank % stride_size, world_size, stride_size))
-    curr_parallel_group = nnscaler.runtime.device.DeviceGroup().get_group(curr_parallel_group_ranks)
+    curr_parallel_group_ranks, curr_parallel_group = \
+        nnscaler.runtime.device.DeviceGroup().get_sync_group(stride_size, world_size)
     src_rank = min(curr_parallel_group_ranks)
 
     return BroadcastGroup(
@@ -450,9 +473,8 @@ def select_many(data: Iterable[ItemT], fn: Callable[[ItemT], Iterable[ItemU]]) -
 
 def first(data: Iterable[ItemT], fn: Optional[Callable[[ItemT], bool]] = None) -> ItemT:
     """Get the first element from the iterable that satisfies the given function."""
-    fn = fn or (lambda x: x)
     for item in data:
-        if fn(item):
+        if fn is None or fn(item):
             return item
     raise ValueError("No element satisfies the condition.")
 
@@ -462,9 +484,8 @@ def first_or(data: Iterable[ItemT], fn: Optional[Callable[[ItemT], bool]] = None
     Get the first element from the iterable that satisfies the given function,
     or return default value.
     """
-    fn = fn or (lambda x: x)
     for item in data:
-        if fn(item):
+        if fn is None or fn(item):
             return item
     return default
 
@@ -748,9 +769,9 @@ def broadcast_files(
     local_rank = curr_rank % local_world_size
 
     # create groups, make sure all groups are created correctly
-    for i in range(local_world_size):
-        group_ranks = list(range(i, world_size, local_world_size))
-        DeviceGroup().get_group(group_ranks)
+    groups = DeviceGroup().get_groups([
+        list(range(i, world_size, local_world_size)) for i in range(local_world_size)
+    ])
 
     # collect file sizes and broadcast
     if curr_rank == 0:
@@ -792,8 +813,7 @@ def broadcast_files(
     def _send_file_group(src, files, file_sizes):
         total_size = sum(file_sizes)
 
-        ranks = list(range(src, world_size, local_world_size))
-        group = DeviceGroup().get_group(ranks)
+        group = groups[src]
         file_buffer = torch.empty(total_size, dtype=torch.uint8, device='cpu').pin_memory()
 
         if curr_rank < local_world_size:

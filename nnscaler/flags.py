@@ -34,6 +34,8 @@ class CompileFlag:
     disable_code_line_info = _to_bool('DISABLE_CODE_LINE_INFO')  # will add original code information in generated code, note that this will make trace slow
     # how to execute the functions during trace, available choices ['cpu', 'cuda', 'meta', 'cuda_run_cpu_offload', 'reuse_cache']
     trace_strategy = os.environ.get('TRACE_STRATEGY', default='cuda_run_cpu_offload')
+    # Maximum concurrent initial-weight shard writes during parsing. Use 1 for serial saves.
+    attr_save_workers = _to_int('ATTR_SAVE_WORKERS', default=8)
     # reduce scatter adapter can reduce the communication cost, and improve the performance
     # but sometimes it may cause communication bugs, so we provide an option to enable/disable it
     disable_reduce_scatter_adapter = _to_bool('DISABLE_REDUCE_SCATTER_ADAPTER', False)
@@ -42,6 +44,9 @@ class CompileFlag:
     dev_mode = _to_bool('SINGLE_DEV_MODE')  # allow to use python xx.py
     async_comm = _to_bool('ASYNC_COMM')
     line_timer = _to_bool('LINE_TIMER')
+    # Pseudo-free sent pipeline outputs after their p2p send has completed.
+    # Set PIPELINE_OUTPUT_PSEUDO_FREE=0 to disable it.
+    pipeline_output_pseudo_free = _to_bool('PIPELINE_OUTPUT_PSEUDO_FREE', True)
 
     # ============== reducer ==================
     # use zero optimization on optimizer status.
@@ -76,10 +81,24 @@ class CompileFlag:
     # You must set it to True when Muon optimizer is used.
     zero_param_level_sharding = _to_bool('ZERO_PARAM_LEVEL_SHARDING')
 
+    # whether to generate weight reducers for replicated weights.
+    # When True, replicated weights will also go through all-reduce and divide by nreplicas,
+    # ensuring gradient consistency across ranks. Default is False (original behavior).
+    reducer_replicated_params = _to_bool('REDUCER_REPLICATED_PARAMS')
+
     # use automate mixture precision training, where weights, gradients
     # and optimizer status are kept in its original data type (can be float32),
     # but some of the forward operators will be converted to float16.
     use_amp = _to_bool('USE_AMP')
+
+    # Traditionally, PP schedules only schedule the 'forward' and 'backward' step
+    # (call these FB schedules).
+    # The Zero Bubble schedule suggests that separating Backward into 'dInput' and 'dWeight' portions
+    # allows for finer-grained scheduling and reduction of pipeline bubbles
+    # (call these FBW schedules).
+    # this flag controls whether to use FBW schedules or FB schedules.
+    # Default is False (FB schedules).
+    use_fbw = _to_bool('USE_FBW')
 
 
 class RuntimeFlag:

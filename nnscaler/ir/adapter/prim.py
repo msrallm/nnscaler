@@ -7,7 +7,9 @@ The primitive used for IRAdapter
 
 from typing import List, Optional, Union, Tuple
 import copy
+import pickle
 
+from nnscaler.ir.cten import IRObject
 from nnscaler.ir.tensor import IRSubTensor, IndexMap, ValueMap
 from nnscaler.flags import CompileFlag
 
@@ -212,6 +214,33 @@ class MovePrim(CommPrim):
         return dscp
 
 
+class ObjectMovePrim(CommPrim):
+    """
+    P2P send/recv for non-tensor IRObject, non-differentiable.
+    Non-tensor objects are always replicated, so only inter-device
+    transfer is needed.
+    """
+    def __init__(self, iobjects: List[IRObject], oobjects: List[IRObject], **kwargs):
+        if len(kwargs) == 0:
+            assert len(iobjects) == 1 and len(oobjects) == 1
+            kwargs['src'] = iobjects[0].device[0] if len(iobjects[0].device) > 0 else None
+            kwargs['dst'] = oobjects[0].device[0] if len(oobjects[0].device) > 0 else None
+        src, dst = kwargs['src'], kwargs['dst']
+        super().__init__(iobjects, oobjects, src=src, dst=dst)
+        self.signature = 'nnscaler.runtime.adapter.move_object'
+
+    def volume(self) -> int:
+        # use pickle size as the volume estimation for non-tensor objects
+        if self._inputs:
+            return len(pickle.dumps(self.input(0).value))
+        else:
+            return len(pickle.dumps(self.output(0).value))
+
+    def __repr__(self):
+        dscp = f"{self.outputs()} = move_object{self.device}({self.inputs()}, src={self.kwargs['src']}, dst={self.kwargs['dst']})"
+        return dscp
+
+
 class CollectivePrim(CommPrim):
     """
     Collective primitive, non-differentiable
@@ -272,7 +301,8 @@ class RVScatterPrim(CollectivePrim):
             kwargs['src'] = itensors[0].device[0] if len(itensors[0].device) > 0 else None
             kwargs['dsts'] = tuple(otensor.device[0] if len(otensor.device) > 0 else None for otensor in otensors)
         shape, dtype, src, dsts = kwargs['shape'], kwargs['dtype'], kwargs['src'], kwargs['dsts']
-        super().__init__(itensors, otensors, shape=shape, dtype=dtype, src=src, dst=dsts)
+        super().__init__(itensors, otensors, shape=shape, dtype=dtype, src=src, dsts=dsts,
+                         ranks=kwargs.get('ranks', (src,) + tuple(dsts)))
         self.signature = 'nnscaler.runtime.adapter.rvscatter'
 
     def volume(self) -> int:
@@ -319,10 +349,11 @@ class RVGatherPrim(CollectivePrim):
             assert len(otensors) == 1
             kwargs['shape'] = itensors[0].origin_shape
             kwargs['dtype'] = str(itensors[0].dtype)
-            kwargs['srcs'] = tuple(otensor.device[0] if len(otensor.device) > 0 else None for otensor in otensors)
+            kwargs['srcs'] = tuple(itensor.device[0] if len(itensor.device) > 0 else None for itensor in itensors)
             kwargs['dst'] = otensors[0].device[0] if len(otensors[0].device) > 0 else None
         shape, dtype, srcs, dst = kwargs['shape'], kwargs['dtype'], kwargs['srcs'], kwargs['dst']
-        super().__init__(itensors, otensors, shape=shape, dtype=dtype, srcs=srcs, dst=dst)
+        super().__init__(itensors, otensors, shape=shape, dtype=dtype, srcs=srcs, dst=dst,
+                         ranks=kwargs.get('ranks', tuple(srcs) + (dst,)))
         self.signature = 'nnscaler.runtime.adapter.rvgather'
 
     def volume(self) -> int:
@@ -336,7 +367,7 @@ class RVGatherPrim(CollectivePrim):
 
 class BroadcastPrim(CollectivePrim):
     """
-    non-differential reduce-scatter
+    non-differential broadcast
     """
     def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], **kwargs):
         if len(kwargs) == 0:
@@ -353,6 +384,26 @@ class BroadcastPrim(CollectivePrim):
 
     def __repr__(self) -> str:
         return f"{self.outputs()} = broadcast{self.device}({self.inputs()}, src={self.kwargs['src']})"
+
+
+class ObjectBroadcastPrim(CollectivePrim):
+    """
+    non-differential broadcast
+    """
+    def __init__(self, iobjects: List[IRObject], oobjects: List[IRObject], **kwargs):
+        if len(kwargs) == 0:
+            assert len(iobjects) == 1
+            kwargs['src'] = iobjects[0].device[0] if len(iobjects[0].device) > 0 else None
+        super().__init__(iobjects, oobjects, **kwargs)
+        self.signature = 'nnscaler.runtime.adapter.broadcast_object'
+
+    def volume(self) -> int:
+        ndevs = len(self.outputs())
+        # use pickle size as the volume estimation for non-tensor objects
+        return len(pickle.dumps(self.input(0).value)) * (ndevs-1)
+
+    def __repr__(self) -> str:
+        return f"{self.outputs()} = broadcast_object{self.device}({self.inputs()}, src={self.kwargs['src']})"
 
 
 class AllReducePrim(CollectivePrim):
@@ -379,6 +430,8 @@ class AllGatherPrim(CollectivePrim):
     non-differentiabl all-to-all
     """
     def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int, **kwargs):
+        if 'ranks' not in kwargs and all(tensor.device for tensor in itensors):
+            kwargs['ranks'] = tuple(tensor.device[0] for tensor in itensors)
         super().__init__(itensors, otensors, dim=dim, **kwargs)
         self.signature = 'nnscaler.runtime.adapter.all_gather'
 
@@ -398,6 +451,9 @@ class ReduceScatterPrim(CollectivePrim):
     non-differential reduce-scatter
     """
     def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int, **kwargs):
+        # Chunk order follows logical output slices, not process-group order.
+        if 'ranks' not in kwargs and all(tensor.device for tensor in otensors):
+            kwargs['ranks'] = tuple(tensor.device[0] for tensor in otensors)
         super().__init__(itensors, otensors, dim=dim, **kwargs)
         self.signature = 'nnscaler.runtime.adapter.reduce_scatter'
 
@@ -441,6 +497,15 @@ class AllToAllPrim(CollectivePrim):
         otensors: each rank hosts one tensor splitted by odim
         idim != odim
         """
+        if 'ranks' not in kwargs and all(tensor.device for tensor in itensors):
+            kwargs['ranks'] = tuple(tensor.device[0] for tensor in itensors)
+        # Dispatch passes global layouts with only this rank's local tensors.
+        # Infer the destination order only while the full output layout is available.
+        if ('ranks' in kwargs and len(otensors) == len(kwargs['ranks'])
+                and all(tensor.device for tensor in otensors)):
+            dsts = tuple(tensor.device[0] for tensor in otensors)
+            if dsts != tuple(kwargs['ranks']):
+                kwargs.setdefault('dsts', dsts)
         super().__init__(itensors, otensors, idim=idim, odim=odim, **kwargs)
         self.signature = 'nnscaler.runtime.adapter.all_to_all'
 
@@ -473,6 +538,8 @@ class ChunkPrim(CollectivePrim):
     split dimension in n chunks and take idx-th chunk
     """
     def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int, **kwargs):
+        if 'ranks' not in kwargs and all(tensor.device for tensor in otensors):
+            kwargs['ranks'] = tuple(tensor.device[0] for tensor in otensors)
         super().__init__(itensors, otensors, dim=dim, **kwargs)
         self.signature = 'nnscaler.runtime.adapter.chunk'
 
@@ -568,7 +635,7 @@ class AllGatherSplitPrim(AllGatherPrim):
         self.signature = 'nnscaler.runtime.adapter.nn.allgather_split'
 
 
-class SplitAllGatherPrim(AllGatherPrim):
+class SplitAllGatherPrim(ChunkPrim):
     """
     forward: split
     backward: all-gather
@@ -576,6 +643,11 @@ class SplitAllGatherPrim(AllGatherPrim):
     def __init__(self, itensors: List[IRSubTensor], otensors: List[IRSubTensor], dim: int, **kwargs):
         super().__init__(itensors, otensors, dim, **kwargs)
         self.signature = 'nnscaler.runtime.adapter.nn.split_allgather'
+
+    def volume(self) -> int:
+        """Per-rank backward ring-all-gather volume, in elements."""
+        ndevs = len(self.kwargs['ranks']) or len(self.outputs())
+        return (ndevs - 1) * self.output(0).nelement()
 
 
 class AllToAllAllToAllPrim(AllToAllPrim):

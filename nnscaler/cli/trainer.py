@@ -25,7 +25,7 @@ from tqdm import tqdm
 
 import nnscaler
 from nnscaler.runtime.device import DeviceGroup
-from nnscaler.utils import broadcast_mixed_data, is_running_distributed
+from nnscaler.utils import broadcast_mixed_data, is_running_distributed, run_on_rank0
 
 from .trainer_args import AggregatedOutputs, TrainerArgs, fix_input
 from .train_hook import AggregatedTrainHook, TrainHook, TrainHookHost
@@ -34,6 +34,20 @@ from .serialization import Checkpointer
 
 
 logger = logging.getLogger(__name__)
+
+
+def _model_config_for_checkpoint_merge(model_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Compare VL model identity independently of rank-local weight staging.
+
+    Only the known wrapper model argument is excluded. Keep equally named
+    keys elsewhere, and never rewrite saved or runtime model configurations.
+    """
+    args = model_config.get('args')
+    if not isinstance(args, dict) or not isinstance(args.get('model_args'), dict):
+        return model_config
+    model_args = args['model_args'].copy()
+    model_args.pop('vision_encoder_path', None)
+    return {**model_config, 'args': {**args, 'model_args': model_args}}
 
 
 @dataclass
@@ -116,6 +130,7 @@ class Trainer:
                 self.dataloader[stage] = None
             if self.hook:
                 self.hook.on_finalize(self)
+            self._log_finalize()
             # It is very common to use `torch.distributed` after training
             # So let's not uninitialize nnscaler here.
             # TODO: make it configurable?
@@ -144,11 +159,26 @@ class Trainer:
         # load a dummy input from training dataset
         self.dummy_input = self.train_args.dummy_input
 
+        # When resuming from checkpoint, skip loading the full init weights
+        # (fullmodel.pt) since they will be overridden by the checkpoint.
+        # Only non-persistent buffers will be loaded from the small npbuffer.pt file.
+        is_resuming = self.train_args.checkpoint.get_resume_checkpoint() is not None
+        init_params = not is_resuming
+        # Trainer owns a CUDA model (see self.model.cuda() below). On resume,
+        # allocate generated tensors there directly; the checkpoint fills them.
+        init_device = (
+            torch.device('cuda', torch.cuda.current_device())
+            if is_resuming and not compile_only
+            else None
+        )
+
         pmodel = parallelize_model(
             self.train_args, self.dummy_input,
             load_module=not compile_only,
             build_buckets=not self.train_args.should_delay_bucket_building(),
             checkpointer=self.checkpointer,
+            init_params=init_params,
+            init_device=init_device,
         )
         if compile_only:
             return
@@ -184,9 +214,14 @@ class Trainer:
             )
         )
         self.local_rank0 = self.local_ranks[0]
-        # create local process groups
-        for local_rank0 in range(0, self.world_size, self.local_world_size):
-            DeviceGroup().get_group(list(range(local_rank0, local_rank0 + self.local_world_size)))
+        # the local rank 0 of every node, used to broadcast checkpoint across nodes
+        # when `slow_fs` is enabled (see `_load_checkpoint`)
+        self.node_leader_ranks = list(range(0, self.world_size, self.local_world_size))
+        local_groups = [
+            list(range(local_rank0, local_rank0 + self.local_world_size))
+            for local_rank0 in range(0, self.world_size, self.local_world_size)
+        ]
+        DeviceGroup().init_groups(local_groups + [self.node_leader_ranks])
 
         self.total_train_steps_per_epoch = len(self.dataloader['train']) // self.train_args.update_freq
         if len(self.dataloader['train']) % self.train_args.update_freq != 0:
@@ -267,11 +302,15 @@ class Trainer:
                 # we pop optimizer state to save cpu memory
                 state_dict.pop('optimizer', None)
             state_dicts.append(state_dict)
+        reference_model_config = _model_config_for_checkpoint_merge(state_dicts[0]['train_args']['model'])
         for i in range(1, len(state_dicts)):
             # NOTE: train_args can be different in different ranks
             # for example, profiling related args can be different,
             # so we don't want to enforce them to be the same across ranks.
-            if state_dicts[i]['train_args']['model'] != state_dicts[0]['train_args']['model']:
+            model_config = _model_config_for_checkpoint_merge(state_dicts[i]['train_args']['model'])
+            if model_config != reference_model_config:
+                # fork tolerance (eaded92a): mismatches here are expected across our
+                # mixed-provenance merges; report loudly instead of refusing.
                 print(f"model config in {checkpoint_files[i]} is different from {checkpoint_files[0]}")
             if state_dicts[i].get('lr_scheduler', None) != state_dicts[0].get('lr_scheduler', None):
                 print(f"lr_scheduler state in {checkpoint_files[i]} is different from {checkpoint_files[0]}")
@@ -392,18 +431,101 @@ class Trainer:
         trimmed_broadcast_required = False
         load_from_merged = False
 
+        slow_fs = self.train_args.checkpoint.resume_from.slow_fs
+        save_memory = self.train_args.checkpoint.resume_from.save_memory
+
+        def _broadcast_to_node_leaders(state_dict):
+            # broadcast only to each node's leader
+            if self.local_rank == 0:
+                logger.info("Broadcasting merged checkpoint to node leaders.")
+                state_dict = self._broadcast_merged_state_dict(
+                    state_dict, src_rank=0, dst_ranks=self.node_leader_ranks
+                )
+                logger.info("Broadcasted merged checkpoint to node leaders.")
+                return state_dict
+            return None
+
+        def _broadcast_to_local_ranks(state_dict):
+            logger.info(f"Broadcasting merged checkpoint to in-node ranks.")
+            state_dict = self._broadcast_merged_state_dict(
+                state_dict, src_rank=self.local_rank0, dst_ranks=self.local_ranks
+            )
+            logger.info(f"Broadcasted merged checkpoint to in-node ranks.")
+            return state_dict
+
+        def _broadcast_to_all_ranks(state_dict):
+            logger.info("Broadcasting merged checkpoint to all ranks.")
+            state_dict = self._broadcast_merged_state_dict(
+                state_dict, src_rank=0, dst_ranks=None
+            )
+            logger.info("Broadcasted merged checkpoint to all ranks.")
+            return state_dict
+
+        def _broadcast_before_trimmed_broadcast(state_dict, innode_broadcast):
+            """Distribute the merged state dict before the trimmed broadcast.
+
+            see `ResumeOptions` for the behavior of `slow_fs` and `save_memory`.
+
+            `innode_broadcast` tells whether an in-node broadcast is needed when
+            neither `slow_fs` nor `save_memory` is set:
+            - file: every rank has already read the full dict, so no
+              broadcast is needed (`innode_broadcast=False`).
+            - sharded: only each node's local rank 0 merged the dict, so it
+              must be broadcast to the other ranks in the node (`innode_broadcast=True`).
+            """
+            if slow_fs:
+                # only rank 0 has state dict
+                if save_memory:
+                    # broadcast only to each node's leader; the trimmed broadcast
+                    # below will distribute it to the other ranks in trimmed broadcast
+                    state_dict = _broadcast_to_node_leaders(state_dict)
+                else:
+                    # broadcast the full merged state dict from global rank 0 to all ranks in one step
+                    state_dict = _broadcast_to_all_ranks(state_dict)
+            else:
+                # all local rank 0 have state dict
+                if save_memory:
+                    # no need to broadcast
+                    # below will distribute it to the other ranks in trimmed broadcast
+                    pass
+                elif innode_broadcast:
+                    # if `innode_broadcast` is False, it means that every rank has already read the full dict
+                    # (e.g., when `resume_from` is a merged checkpoint file) so no broadcast is needed
+                    # If `innode_broadcast` is True, it means that only each node's local rank 0 has the full dict
+                    # (e.g., when `resume_from` is a sharded checkpoint directory)
+                    # so we need to broadcast it to the other ranks in the node.
+                    state_dict = _broadcast_to_local_ranks(state_dict)
+            return state_dict
+
         if resume_from.is_file():
             # when we load from merged checkpoint
             load_from_merged = True
-            trimmed_broadcast_required = self.train_args.checkpoint.resume_from.save_memory
-            if not self.train_args.checkpoint.resume_from.save_memory or self.local_rank == 0:
+            trimmed_broadcast_required = save_memory
+            if slow_fs:
+                # slow filesystem: only the global rank 0 reads the file,
+                should_read = self.rank == 0
+            elif save_memory:
+                # each node's local rank 0 reads the file
+                should_read = self.local_rank == 0
+            else:
+                # every rank reads and uses the full merged state dict
+                should_read = True
+
+            if should_read:
                 state_dict = self.checkpointer.load(resume_from)
                 if convert_fn := self.train_args.checkpoint.resolved_convert_fn:
                     state_dict = convert_fn(state_dict)
             else:
                 state_dict = None
+
+            state_dict = _broadcast_before_trimmed_broadcast(state_dict, False)
         else:
-            ckpt_files = self.checkpointer.list_checkpoints(resume_from)
+            # Metadata is shared; each rank still reads its own state and
+            # performs the existing topology/completeness checks below. Send
+            # only filenames so node-local mount prefixes remain supported.
+            filenames = run_on_rank0(
+                lambda: [path.name for path in self.checkpointer.list_checkpoints(resume_from)])
+            ckpt_files = [resume_from / name for name in filenames]
             rank_ckpt_files = {int(f.stem): f for f in ckpt_files if f.stem.isdigit()}
             if set(rank_ckpt_files.keys()) != set(range(len(rank_ckpt_files))):
                 raise ValueError(f"Checkpoint files in {resume_from} are not complete: {rank_ckpt_files.keys()}")
@@ -414,20 +536,18 @@ class Trainer:
             if len(rank_ckpt_files) != self.world_size or self.train_args.checkpoint.resume_from.with_merged:
                 # merge the checkpoint files from all ranks and broadcast to all ranks
                 torch.distributed.barrier()
-                if self.local_rank == 0:
+                # normally each node's local rank 0 reads and merges the checkpoint files.
+                # with a slow filesystem, only the global rank 0 reads and merges them,
+                # then broadcasts the merged state dict to the local rank 0 of every node.
+                if self.rank == 0 or (not slow_fs and self.local_rank == 0):
                     logger.info(f"Merging checkpoint files from {resume_from}")
                     state_dict = self._merge_checkpoint(list(rank_ckpt_files.values()), checkpointer=self.checkpointer)
                 else:
                     state_dict = None
 
                 load_from_merged = True
-                trimmed_broadcast_required = self.train_args.checkpoint.resume_from.save_memory
-                if not self.train_args.checkpoint.resume_from.save_memory:
-                    logger.info(f"Broadcasting merged checkpoint to all ranks.")
-                    state_dict = self._broadcast_merged_state_dict(
-                        state_dict, src_rank=self.local_rank0, dst_ranks=self.local_ranks
-                    )
-                    logger.info(f"Broadcasted merged checkpoint to all ranks.")
+                trimmed_broadcast_required = save_memory
+                state_dict = _broadcast_before_trimmed_broadcast(state_dict, True)
             else:
                 state_dict = self.checkpointer.load_for_rank(resume_from, self.rank)
                 if state_dict['train_args']['compute_config'] != asdict(self.train_args.compute_config):
@@ -778,13 +898,7 @@ class Trainer:
                 return [rank], None
 
             from nnscaler.runtime.device import DeviceGroup
-            # make sure all needed device groups have been created to make safe
-            for i in range(group_size):
-                DeviceGroup().get_group(
-                    list(range(i, runtime_ngpus, group_size))
-                )
-            rank_list = list(range(rank % group_size, runtime_ngpus, group_size))
-            return rank_list, DeviceGroup().get_group(rank_list)
+            return DeviceGroup().get_sync_group(group_size, runtime_ngpus)
 
         rank_list, sync_group = get_optimizer_sync_group()
 
@@ -883,7 +997,6 @@ class Trainer:
                 # finished with max_epochs
                 logger.info(f"Reached max_epochs({self.train_args.max_epochs}): Training is done.")
 
-        self._log_finalize()
         self.hook.on_train_end(self)
         torch.distributed.barrier()
 

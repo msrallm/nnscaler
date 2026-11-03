@@ -4,9 +4,12 @@
 """
 pytest unit_tests/runtime/test_reducer.py
 """
+import io
+import os
 import torch
 import logging
 from functools import partial
+from unittest.mock import ANY, Mock, patch
 
 import pytest
 
@@ -16,9 +19,16 @@ from nnscaler.utils import load_model
 from nnscaler.graph import IRGraph
 from nnscaler.ir.operator import IRFwOperation
 from nnscaler.flags import CompileFlag
-from nnscaler.runtime.adapter.reducer import Reducer
+from nnscaler.runtime.adapter.reducer import (
+    FlattenParamInfo,
+    Reducer,
+    ReducerParamInfo,
+    accumulate_reducer_grad,
+    has_reducer_grad_accumulator,
+    mark_reducer_grad_ready,
+)
 from nnscaler.runtime.device import DeviceGroup
-from ..launch_torchrun import torchrun
+from ..launch_torchrun import launch_torchrun, torchrun
 from ..utils import catch_log, init_parameter, assert_parity, mock_reducer_env
 
 
@@ -141,6 +151,116 @@ def reducer_test():
 test_reducer_2gpu = partial(torchrun, 2, reducer_test)
 
 
+def test_flatten_param_info_dtype():
+    params = [
+        torch.nn.Parameter(torch.zeros(2, dtype=torch.float16)),
+        torch.nn.Parameter(torch.zeros(2, dtype=torch.float16)),
+    ]
+    flatten_info = FlattenParamInfo(
+        zero=0,
+        params_info={
+            params[0]: ReducerParamInfo(
+                shape=params[0].shape,
+                start=0,
+                end=2,
+                bucket_param_buffer_start=0,
+                bucket_param_buffer_end=2,
+            ),
+            params[1]: ReducerParamInfo(
+                shape=params[1].shape,
+                start=0,
+                end=2,
+                bucket_param_buffer_start=2,
+                bucket_param_buffer_end=4,
+            ),
+        },
+        opt_numel=4,
+        opt_num_chunks=1,
+        opt_chunk_index=0,
+    )
+
+    tensor = torch.tensor([1, 2], dtype=torch.float32)
+    with pytest.raises(ValueError, match="tensors length 1 does not match the expected length 2"):
+        flatten_info.flatten([tensor])
+
+    flattened = flatten_info.flatten([None, tensor])
+    assert flattened.device.type == 'cpu'
+    assert not flattened.is_pinned()
+    assert flattened.dtype == torch.float32
+    assert flattened.equal(torch.tensor([0, 0, 1, 2], dtype=torch.float32))
+
+    unflattened = flatten_info.unflatten(flattened, device='cpu')
+    assert all(output.device.type == 'cpu' and not output.is_pinned() for output in unflattened)
+    assert unflattened[0].equal(torch.zeros(2, dtype=torch.float32))
+    assert unflattened[1].equal(tensor)
+
+    flattened = flatten_info.flatten([None, tensor], dtype=torch.float64, device='cpu')
+    assert flattened.dtype == torch.float64
+    assert flattened.equal(torch.tensor([0, 0, 1, 2], dtype=torch.float64))
+
+    flattened = flatten_info.flatten([None, None], dtype=torch.float64, device='cpu')
+    assert flattened.dtype == torch.float64
+    assert flattened.equal(torch.zeros(4, dtype=torch.float64))
+
+    flattened = flatten_info.flatten([None, None], device='cpu')
+    assert flattened.dtype == torch.float16  # default to first param's dtype
+    assert flattened.equal(torch.zeros(4, dtype=torch.float16))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='lack of gpu devices')
+def test_flatten_param_info_cuda_device_and_synchronization(monkeypatch):
+    param = torch.nn.Parameter(torch.zeros(2))
+    flatten_info = FlattenParamInfo(
+        zero=0,
+        params_info={
+            param: ReducerParamInfo(
+                shape=param.shape,
+                start=0,
+                end=2,
+                bucket_param_buffer_start=0,
+                bucket_param_buffer_end=2,
+            ),
+        },
+        opt_numel=2,
+        opt_num_chunks=1,
+        opt_chunk_index=0,
+    )
+
+    synchronize_calls = 0
+    cuda_synchronize = torch.cuda.synchronize
+
+    def record_synchronize():
+        nonlocal synchronize_calls
+        synchronize_calls += 1
+        cuda_synchronize()
+
+    monkeypatch.setattr(torch.cuda, 'synchronize', record_synchronize)
+
+    tensor = torch.tensor([1, 2], dtype=torch.float32)
+    cuda_flattened = flatten_info.flatten([tensor], device=0)
+
+    assert cuda_flattened.device == torch.device(0)
+    assert synchronize_calls == 0
+
+    cpu_flattened = flatten_info.flatten([cuda_flattened], device='cpu')
+
+    assert synchronize_calls == 1
+    assert cpu_flattened.is_pinned()
+    assert cpu_flattened.equal(tensor)
+
+    cuda_unflattened = flatten_info.unflatten(cuda_flattened, device=0)
+
+    assert synchronize_calls == 1
+    assert cuda_unflattened[0].device == torch.device(0)
+    assert cuda_unflattened[0].cpu().equal(tensor)
+
+    cpu_unflattened = flatten_info.unflatten(cuda_flattened, device='cpu')
+
+    assert synchronize_calls == 2
+    assert cpu_unflattened[0].is_pinned()
+    assert cpu_unflattened[0].equal(tensor)
+
+
 @mock_reducer_env(0, 2)
 def test_reducer_build():
     reducer = Reducer([0, 1], max_bucket_size_bytes=48)  # 24 bytes means 12 float32
@@ -165,6 +285,76 @@ def test_reducer_build():
     assert buckets[4]._aligned_numel == 4
 
 
+@mock_reducer_env(0, 2)
+def test_reducer_wake_up_rebinds_buckets_to_correct_slices():
+    """Regression test for the reducer wake_up bug.
+
+    Each bucket owns its buffer slice via its own `_start` / `_stop`, and
+    `wake_up()` re-binds every bucket to `buffer[bucket._start:bucket._stop]`.
+    Because the slice is derived from the bucket's own offsets, the binding is
+    correct regardless of the order in which buckets are stored (they are kept in
+    reversed, tail-to-head backward order). This test builds several
+    differently-sized buckets and asserts each bucket points at the same buffer
+    slice before and after a sleep/wake_up cycle.
+    """
+    reducer = Reducer([0, 1], max_bucket_size_bytes=48)
+    reducer.add_param(torch.nn.Parameter(torch.randn(1, 2)))   # bucket 0
+    reducer.add_param(torch.nn.Parameter(torch.randn(1, 14)))  # bucket 1
+    reducer.add_param(torch.nn.Parameter(torch.randn(1, 5)))   # bucket 2
+    reducer.add_param(torch.nn.Parameter(torch.randn(1, 5)))   # bucket 3
+    reducer.add_param(torch.nn.Parameter(torch.randn(1, 1)))   # bucket 3
+    reducer.add_param(torch.nn.Parameter(torch.randn(1, 1)))   # bucket 4
+    reducer.build_buckets()
+    assert len(reducer.buckets) == 5
+
+    # each bucket must be bound to the slice described by starts/stops at its index
+    for bucket in reducer.buckets:
+        assert bucket._contiguous_params.storage_offset() == bucket._start
+        assert bucket._contiguous_params.numel() == bucket._stop - bucket._start
+        assert bucket._contiguous_grads.storage_offset() == bucket._start
+        assert bucket._contiguous_grads.numel() == bucket._stop - bucket._start
+
+    # record each bucket's buffer slice (by identity) before offloading
+    before = [
+        (bucket._contiguous_params.storage_offset(), bucket._contiguous_params.numel())
+        for bucket in reducer.buckets
+    ]
+
+    reducer.sleep()
+    reducer.wake_up()
+
+    # after wake_up, every bucket must be re-bound to exactly the same slice
+    after = [
+        (bucket._contiguous_params.storage_offset(), bucket._contiguous_params.numel())
+        for bucket in reducer.buckets
+    ]
+    assert before == after
+    for bucket in reducer.buckets:
+        assert bucket._contiguous_params.storage_offset() == bucket._start
+        assert bucket._contiguous_params.numel() == bucket._stop - bucket._start
+        assert bucket._contiguous_grads.storage_offset() == bucket._start
+        assert bucket._contiguous_grads.numel() == bucket._stop - bucket._start
+
+
+@mock_reducer_env(0, 2)
+def test_reducer_nreplicas():
+    """Test that nreplicas is correctly passed to buckets"""
+    # Test nreplicas defaults to 1
+    reducer = Reducer([0, 1])
+    assert reducer._nreplicas == 1
+
+    # Test nreplicas is set correctly
+    reducer = Reducer([0, 1], nreplicas=2)
+    assert reducer._nreplicas == 2
+
+    # Test nreplicas is passed to buckets
+    reducer = Reducer([0, 1], nreplicas=3)
+    reducer.add_param(torch.nn.Parameter(torch.randn(4)))
+    reducer.build_buckets()
+    for bucket in reducer.buckets:
+        assert bucket._nreplicas == 3
+
+
 def _add_scalar_params(reducer, num_params, param_clss=None, param_cls=None):
     # NOTE: all params will be aligned to 16 bytes.
     # So even 1 float32 param will take 16 bytes in the bucket.
@@ -176,6 +366,22 @@ def _add_scalar_params(reducer, num_params, param_clss=None, param_cls=None):
         if param_clss is not None:
             param_clss[param] = param_cls
     return params
+
+
+class _ManualReducerGrad(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, param, chunks):
+        ctx.save_for_backward(param)
+        ctx.chunks = chunks
+        return param.sum()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        param, = ctx.saved_tensors
+        for grad, offset in ctx.chunks:
+            assert accumulate_reducer_grad(param, grad, offset)
+        assert mark_reducer_grad_ready(param)
+        return None, None
 
 
 @mock_reducer_env(0, 8)
@@ -195,7 +401,7 @@ def test_reducer_build_zero_param_level_sharding_merges_single_param_tail():
 
     reducer.build_buckets()
 
-    buckets = list(reversed(reducer.buckets))
+    buckets = list(reducer.buckets)
     assert [len(bucket.params) for bucket in buckets] == [9]
 
 
@@ -235,7 +441,8 @@ def test_reducer_build_zero_param_level_sharding_keeps_param_classes_separate():
 
 
 @mock_reducer_env(0, 8)
-def test_reducer_build_zero_param_level_sharding_rejects_too_few_params():
+def test_reducer_build_zero_param_level_sharding_pads_too_few_params():
+    """When fewer params than zero_size, padding is added so that some ranks get empty shards."""
     reducer = Reducer(
         list(range(8)),
         max_bucket_size_bytes=128,
@@ -244,8 +451,86 @@ def test_reducer_build_zero_param_level_sharding_rejects_too_few_params():
     )
     _add_scalar_params(reducer, 7)
 
-    with pytest.raises(RuntimeError, match="Please disable ZeRO or disable parameter-level sharding or increase bucket size."):
+    from nnscaler.runtime.adapter.reducer import _logger
+    with catch_log(_logger) as log_stream:
         reducer.build_buckets()
+        logs = log_stream.getvalue()
+        assert "Padding will be added so that some ranks have empty shards" in logs
+
+    buckets = list(reversed(reducer.buckets))
+    assert len(buckets) == 1
+    assert len(buckets[0].params) == 7
+    # buffer should be max_group_size * zero_size = 4 * 8 = 32
+    # (each scalar param is aligned to 4 float32 = 16 bytes)
+    assert buckets[0]._contiguous_params.numel() == 4 * 8
+
+
+@mock_reducer_env(0, 8)
+def test_reducer_build_zero_param_level_sharding_pads_single_param():
+    """A single param with zero_param_level_sharding should pad to zero_size chunks."""
+    reducer = Reducer(
+        list(range(8)),
+        max_bucket_size_bytes=128,
+        zero=1,
+        zero_param_level_sharding=True,
+    )
+    _add_scalar_params(reducer, 1)
+
+    reducer.build_buckets()
+
+    buckets = list(reversed(reducer.buckets))
+    assert len(buckets) == 1
+    assert len(buckets[0].params) == 1
+    # buffer = max_group_size(4) * zero_size(8) = 32
+    assert buckets[0]._contiguous_params.numel() == 4 * 8
+
+
+@mock_reducer_env(0, 8)
+def test_reducer_build_zero_param_level_sharding_pads_with_classes():
+    """Two param classes each with fewer params than zero_size should each get their own padded bucket."""
+    reducer = Reducer(
+        list(range(8)),
+        max_bucket_size_bytes=128,
+        zero=1,
+        zero_param_level_sharding=True,
+    )
+    param_clss = {}
+    _add_scalar_params(reducer, 3, param_clss, 0)
+    _add_scalar_params(reducer, 5, param_clss, 1)
+
+    reducer.build_buckets(param_clss=param_clss)
+
+    buckets = list(reversed(reducer.buckets))
+    assert len(buckets) == 2
+    assert [len(b.params) for b in buckets] == [3, 5]
+    assert [b.param_cls[0] for b in buckets] == [0, 1]
+    # each bucket buffer = 4 * 8 = 32
+    assert buckets[0]._contiguous_params.numel() == 4 * 8
+    assert buckets[1]._contiguous_params.numel() == 4 * 8
+
+
+@mock_reducer_env(0, 4)
+def test_reducer_build_zero_param_level_sharding_pads_mixed_sizes():
+    """Params with different sizes, fewer than zero_size, should pad using max aligned size."""
+    reducer = Reducer(
+        list(range(4)),
+        max_bucket_size_bytes=1024,
+        zero=1,
+        zero_param_level_sharding=True,
+    )
+    # Add 2 params of different sizes: 1 float32 (aligned to 4) and 5 float32 (aligned to 8)
+    p1 = torch.nn.Parameter(torch.randn(1))
+    p2 = torch.nn.Parameter(torch.randn(5))
+    reducer.add_param(p1)
+    reducer.add_param(p2)
+
+    reducer.build_buckets()
+
+    buckets = list(reversed(reducer.buckets))
+    assert len(buckets) == 1
+    assert len(buckets[0].params) == 2
+    # max aligned size is 8 (from param of size 5), buffer = 8 * 4 = 32
+    assert buckets[0]._contiguous_params.numel() == 8 * 4
 
 
 @mock_reducer_env(0, 8)
@@ -308,3 +593,213 @@ def test_reducer_build_zero_param_level_sharding_zero_ngroups_chunk_by_zero_subg
     buckets = list(reversed(reducer.buckets))
     assert buckets[0]._contiguous_grads.numel() == 8
     assert buckets[0]._flatten_param_info.opt_num_chunks == 2
+
+
+@mock_reducer_env(0, 2)
+def test_manual_grad_slice_accumulates_in_reducer_buffer_without_param_grad():
+    param = torch.nn.Parameter(torch.zeros(3, 2))
+    reducer = Reducer([0, 1])
+    reducer.add_param(param)
+    reducer.build_buckets()
+    bucket = reducer.buckets[0]
+
+    assert has_reducer_grad_accumulator(param)
+    _ManualReducerGrad.apply(param, [
+        (torch.tensor([[1.0, 2.0]]), 2),
+        (torch.tensor([[3.0, 4.0]]), 4),
+    ]).backward()
+
+    assert param.grad is None
+    offset = bucket._pofset[param]
+    torch.testing.assert_close(
+        bucket._contiguous_grads[offset:offset + param.numel()],
+        torch.tensor([0.0, 0.0, 1.0, 2.0, 3.0, 4.0]),
+    )
+
+
+@mock_reducer_env(0, 2)
+def test_reducer_grad_registration_keeps_parameter_picklable():
+    param = torch.nn.Parameter(torch.zeros(2))
+    reducer = Reducer([0, 1])
+    reducer.add_param(param)
+    reducer.build_buckets()
+
+    assert has_reducer_grad_accumulator(param)
+    buffer = io.BytesIO()
+    torch.save(param, buffer)
+
+
+@mock_reducer_env(0, 2)
+def test_manual_grad_ready_uses_async_vpp_expected_contribution_count():
+    param = torch.nn.Parameter(torch.zeros(2))
+    reducer = Reducer([0, 1], async_op=True)
+    reducer.add_param(param)
+    reducer.build_buckets()
+    reducer.grad_accumulation_steps = 1
+    reducer.set_async_grad_expected_counts({param: 2})
+    bucket = reducer.buckets[0]
+    bucket._launch_async_reduce = Mock()
+
+    _ManualReducerGrad.apply(
+        param, [(torch.tensor([1.0, 2.0]), 0)]
+    ).backward()
+    bucket._launch_async_reduce.assert_not_called()
+
+    _ManualReducerGrad.apply(
+        param, [(torch.tensor([3.0, 4.0]), 0)]
+    ).backward()
+    bucket._launch_async_reduce.assert_called_once_with()
+    assert bucket._async_seen_param_cnt[param] == 2
+    assert bucket._async_param_cnt == bucket._async_expected_total == 2
+    assert param.grad is None
+
+
+@mock_reducer_env(0, 2)
+def test_scheduled_counts_override_uniform_accumulation_each_step():
+    ordinary = torch.nn.Parameter(torch.zeros(2))
+    shared = torch.nn.Parameter(torch.zeros(2))
+    reducer = Reducer([0, 1], async_op=True)
+    for param in (ordinary, shared):
+        reducer.add_param(param)
+    reducer.build_buckets()
+    assert len(reducer.buckets) == 1
+    bucket = reducer.buckets[0]
+    bucket._launch_async_reduce = Mock()
+
+    for microbatches in (12, 2):
+        with patch("torch.cuda.synchronize"):
+            reducer.zero_grad()
+        bucket._launch_async_reduce.reset_mock()
+        # ParallelModule.train_step sets this before the generated schedule.
+        reducer.grad_accumulation_steps = microbatches
+        reducer.set_async_grad_expected_counts({
+            ordinary: microbatches, shared: 3 * microbatches,
+        })
+        assert reducer.grad_accumulation_steps == bucket.grad_accumulation_steps == 0
+        for index in range(3 * microbatches):
+            loss = shared.sum() * 2
+            if index < microbatches:
+                loss = loss + ordinary.sum()
+            loss.backward()
+            if index < 3 * microbatches - 1:
+                bucket._launch_async_reduce.assert_not_called()
+        bucket._launch_async_reduce.assert_called_once_with()
+        assert bucket._async_seen_param_cnt == {
+            ordinary: microbatches, shared: 3 * microbatches,
+        }
+        for param, expected in ((ordinary, microbatches), (shared, 6 * microbatches)):
+            offset = bucket._pofset[param]
+            assert torch.equal(bucket._contiguous_grads[offset:offset + 2],
+                               torch.full((2,), float(expected)))
+        with pytest.raises(RuntimeError, match='more async reducer gradient contributions'):
+            shared.sum().backward()
+
+    # An ordinary unscheduled caller can explicitly select uniform mode again.
+    with patch("torch.cuda.synchronize"):
+        reducer.zero_grad()
+    reducer.grad_accumulation_steps = 2
+    bucket._launch_async_reduce.reset_mock()
+    (ordinary.sum() + shared.sum()).backward()
+    bucket._launch_async_reduce.assert_not_called()
+    (ordinary.sum() + shared.sum()).backward()
+    bucket._launch_async_reduce.assert_called_once_with()
+
+
+@mock_reducer_env(0, 2)
+def test_manual_grad_combines_with_regular_autograd_path_before_async_ready():
+    param = torch.nn.Parameter(torch.zeros(2))
+    reducer = Reducer([0, 1], async_op=True)
+    reducer.add_param(param)
+    reducer.build_buckets()
+    bucket = reducer.buckets[0]
+    bucket._launch_async_reduce = Mock()
+
+    loss = _ManualReducerGrad.apply(
+        param, [(torch.tensor([1.0, 2.0]), 0)]
+    ) + (param * 3.0).sum()
+    loss.backward()
+
+    offset = bucket._pofset[param]
+    torch.testing.assert_close(
+        bucket._contiguous_grads[offset:offset + param.numel()],
+        torch.tensor([4.0, 5.0]),
+    )
+    bucket._launch_async_reduce.assert_called_once_with()
+    assert bucket._async_param_cnt == 1
+    assert param.grad is None
+
+
+@mock_reducer_env(0, 2)
+def test_manual_grad_slice_zero3_reduces_by_owner_and_postevicts_param():
+    param = torch.nn.Parameter(torch.zeros(8))
+    reducer = Reducer([0, 1], zero=3)
+    reducer.add_param(param)
+    reducer.build_buckets()
+    bucket = reducer.buckets[0]
+    info = reducer.get_z3_info(param)
+
+    # Emulate the full parameter materialized for forward/backward. The mock
+    # process group cannot execute collectives, so retain the local input in
+    # the patched all-reduce call (the rank-0 result for a single local source).
+    param.data = torch.zeros(info.shape)
+    with patch('torch.distributed.all_reduce') as all_reduce:
+        _ManualReducerGrad.apply(
+            param, [(torch.arange(1.0, 7.0), 0)]
+        ).backward()
+        all_reduce.assert_called_once_with(
+            ANY,
+            op=bucket._reduce_op,
+            group=bucket._zero_subgroup,
+        )
+
+    offset = bucket._pofset[param]
+    torch.testing.assert_close(
+        bucket._contiguous_grads[offset:offset + info.numel()],
+        torch.tensor([1.0, 2.0, 3.0, 4.0]),
+    )
+    assert param.grad is None
+    assert param.shape == (info.numel_with_padding(),)
+
+
+def _manual_grad_slice_zero3_distributed_worker():
+    local_rank = int(os.environ['LOCAL_RANK'])
+    torch.cuda.set_device(local_rank)
+    torch.distributed.init_process_group(backend='nccl')
+
+    rank = torch.distributed.get_rank()
+    param = torch.nn.Parameter(torch.zeros(8, device=local_rank))
+    reducer = Reducer([0, 1], zero=3)
+    reducer.add_param(param)
+    reducer.build_buckets()
+    bucket = reducer.buckets[0]
+    info = reducer.get_z3_info(param)
+
+    # Materialize the full parameter as a normal ZeRO-3 forward would do.
+    param.data = torch.zeros(info.shape, device=local_rank)
+    base_grad = torch.arange(1.0, 7.0, device=local_rank)
+    contribution = base_grad * (1 if rank == 0 else 10)
+    _ManualReducerGrad.apply(param, [(contribution, 0)]).backward()
+
+    reduced = base_grad * 11
+    expected_full = torch.cat((reduced, torch.zeros(2, device=local_rank)))
+    expected_local = expected_full[info.start:info.end]
+    offset = bucket._pofset[param]
+    torch.testing.assert_close(
+        bucket._contiguous_grads[offset:offset + info.numel()],
+        expected_local,
+    )
+    assert param.grad is None
+    assert param.shape == (info.numel_with_padding(),)
+
+    reducer.sync_grads()
+    torch.testing.assert_close(param.grad[:info.numel()], expected_local)
+    torch.distributed.barrier()
+    torch.distributed.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason='requires two CUDA devices',
+)
+def test_manual_grad_slice_zero3_real_collective_2gpu():
+    launch_torchrun(2, _manual_grad_slice_zero3_distributed_worker)

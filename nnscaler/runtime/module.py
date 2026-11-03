@@ -2,6 +2,7 @@
 #  Licensed under the MIT License.
 
 import functools
+import copy
 import pickle
 from typing import Callable, List, Set, Dict, Tuple, Optional, TYPE_CHECKING, Any, Union, ClassVar
 from typing_extensions import Self
@@ -13,12 +14,15 @@ import warnings
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
+from contextlib import contextmanager
+from contextvars import ContextVar
 import math
 
 import torch
 import torch.distributed as dist
 from torch import device
 from torch.autograd.graph import saved_tensors_hooks
+from torch.torch_version import TorchVersion
 
 from nnscaler.graph.parser import FxModuleParser
 
@@ -39,6 +43,90 @@ if TYPE_CHECKING:
 
 
 _logger = logging.getLogger(__name__)
+_merged_load_visits = ContextVar('nnscaler_merged_load_visits', default=None)
+
+
+def _can_reuse_merged_load(module):
+    # Custom loaders and hooks may change destination weights without changing
+    # checkpoint tensors (including through .data, which bypasses versions).
+    # Keep the original two-pass behavior unless all handlers are known.
+    for child in module.modules():
+        if getattr(child.load_state_dict, '__func__', None) is not torch.nn.Module.load_state_dict:
+            return False
+        if getattr(child._load_from_state_dict, '__func__', None) not in (
+                torch.nn.Module._load_from_state_dict, ParallelModule._load_from_state_dict):
+            return False
+        if (isinstance(child, ParallelModule)
+                and getattr(child.load_merged_state_dict, '__func__', None)
+                is not ParallelModule.load_merged_state_dict):
+            # A custom loader may do more than check missing keys under strict=True.
+            return False
+        if child._load_state_dict_post_hooks:
+            return False
+        for wrapped_hook in child._load_state_dict_pre_hooks.values():
+            hook = getattr(wrapped_hook, 'hook', wrapped_hook)
+            if getattr(hook, '__func__', hook) is not ParallelModule._pre_load_state_dict_hook:
+                return False
+    return True
+
+
+@contextmanager
+def merged_load_session(module=None):
+    """Deduplicate successful module loads within one restore invocation.
+
+    Nested restores get independent records. Never retain a loaded flag on the
+    module: a subsequent restore must write checkpoint values again.
+    A supplied module with custom loading callbacks keeps the original passes,
+    since callbacks can mutate destination weights independently of the source.
+    """
+    parent = _merged_load_visits.get()
+    visits = {} if module is None or _can_reuse_merged_load(module) else None
+    token = _merged_load_visits.set(visits)
+    try:
+        yield
+    finally:
+        _merged_load_visits.reset(token)
+        if parent is not None:
+            # A nested restore may have changed a module the parent had loaded.
+            parent.clear()
+
+
+def load_merged_module(module, state_dict, prefix='', strict=True):
+    """Share completion records between the recursive and explicit load passes."""
+    visits = _merged_load_visits.get()
+    source = None
+    if visits is not None:
+        # Recursive load_state_dict creates shallow dictionaries. Tensor
+        # identity + mutation version recognize the same values across these
+        # dictionaries without reading tensor contents. Custom transformed
+        # inputs must load again; unversioned/opaque state is not cached.
+        source = {}
+        for key, value in state_dict.items():
+            if not key.startswith(prefix):
+                continue
+            if not isinstance(value, torch.Tensor) or value.is_inference():
+                source = None
+                break
+            source[key] = (value, value._version)
+    previous = visits.get(module) if visits is not None else None
+    if (previous is not None and previous[0] == prefix and source is not None
+            and source.keys() == previous[1].keys()
+            and all(value is previous[1][key][0] and version == previous[1][key][1]
+                    for key, (value, version) in source.items())):
+        missing_keys = list(previous[2])
+        if strict and missing_keys:
+            raise RuntimeError(f'Missing key(s) in state_dict: {missing_keys}.')
+        return missing_keys
+
+    # A different alias can overwrite the same module. Only its most recent
+    # completed prefix can be skipped; the canonical fallback may need to run
+    # again. Failed/partial loads must not leave a completion record either.
+    if visits is not None:
+        visits.pop(module, None)
+    missing_keys = module.load_merged_state_dict(state_dict, prefix, strict=strict)
+    if visits is not None and source is not None:
+        visits[module] = (prefix, source, tuple(missing_keys))
+    return missing_keys
 
 
 @dataclass
@@ -51,7 +139,7 @@ class AttrMeta:
     orig_name: str
     # shape of the full tensor
     shape: Tuple[int, ...]
-    # list of slicers to index the full tensor
+    # Per-dimension slices; an empty tuple indexes a scalar tensor.
     slicers: Tuple[slice, ...]
     # the number of the partitioned values, usually 1
     # (i.e., no partition on value -> no need to sum up)
@@ -61,6 +149,17 @@ class AttrMeta:
     # shape of the sub tensor
     # it should be the shape of full_tensor[slicers]
     sub_shape: Tuple[int, ...]
+
+    def __post_init__(self):
+        # Legacy generated metadata represents scalar indexing as Ellipsis/'...'.
+        if not self.shape:
+            self.slicers = ()
+            # The old IR represented scalars with a synthetic one-element axis.
+            self.sub_shape = ()
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.__post_init__()
 
     def get_local_numel(self):
         return math.prod(self.sub_shape)
@@ -227,6 +326,51 @@ class CubeModule(torch.nn.Module):
                 non_persistent_buffers[name] = buffer
         return non_persistent_buffers
 
+    @torch.no_grad()
+    def init_aliased_buffers(self, name_map, state_dict=None):
+        """Initialize frozen replicas without adding them to checkpoints.
+
+        ``name_map`` maps original buffer names (from ``fullmap``) to original
+        source names. With a full ``state_dict``, trim each source to the local
+        buffer's slice. Otherwise copy a colocated source attribute with the
+        same layout, after the training model has been restored. Missing or
+        incompatible sources are errors; unrelated buffers are left alone.
+        """
+        buffers = self.get_non_persistent_buffers()
+        sources = defaultdict(list)
+        for attr, meta in self.fullmap.items():
+            sources[meta.orig_name].append((attr, meta))
+        copies = []
+        for attr, meta in self.fullmap.items():
+            if meta.orig_name not in name_map:
+                continue
+            if attr not in buffers:
+                raise ValueError(f'{meta.orig_name} is not a non-persistent buffer')
+            source_name = name_map[meta.orig_name]
+            if meta.val_chunks != 1:
+                raise ValueError(f'Value-partitioned replica is unsupported: {meta.orig_name}')
+            if state_dict is not None:
+                if source_name not in state_dict:
+                    raise RuntimeError(f'Missing replica source: {source_name}')
+                source = state_dict[source_name]
+                if tuple(source.shape) != tuple(meta.shape):
+                    raise ValueError(f'Replica source shape mismatch for {source_name}: '
+                                     f'{tuple(source.shape)} != {tuple(meta.shape)}')
+                source = source[meta.slicers]
+            else:
+                matches = [(a, m) for a, m in sources[source_name]
+                           if m.shape == meta.shape and m.slicers == meta.slicers
+                           and m.val_chunks == meta.val_chunks]
+                if not matches:
+                    raise RuntimeError(f'No colocated replica source with matching layout: '
+                                       f'{source_name} for {meta.orig_name}')
+                source = getattr(self, matches[0][0])
+            if tuple(source.shape) != tuple(buffers[attr].shape):
+                raise ValueError(f'Replica local shape mismatch for {meta.orig_name}')
+            copies.append((buffers[attr], source))
+        for target, source in copies:
+            target.copy_(source)
+
     @property
     def reducers(self):
         return self._reducers
@@ -380,39 +524,128 @@ class CubeModule(torch.nn.Module):
             filename (str): base file name (without '.0', '.1', etc.)
                 that saved with model parameters
         """
-        npartitions = 0
-        while os.path.isfile(filename + f'.{npartitions}'):
-            npartitions += 1
-        if npartitions == 0:
-            raise RuntimeError(f"Cannot find file {filename}.0 in load_attr_content")
+        index_filename = filename + '.index'
+        has_index = os.path.isfile(index_filename)
+        tid_to_chunk = None
+        if has_index:
+            tid_to_chunk: Dict[int, int] = torch.load(index_filename, weights_only=True)
+            if not isinstance(tid_to_chunk, dict):
+                raise RuntimeError(f"Invalid attribute content index {index_filename}")
+            chunk_ids = set(tid_to_chunk.values())
+            if any(type(chunk_id) is not int or chunk_id < 0 for chunk_id in chunk_ids):
+                raise RuntimeError(f"Invalid chunk IDs in attribute content index {index_filename}")
+            npartitions = max(chunk_ids) + 1 if chunk_ids else 1
+            if chunk_ids and chunk_ids != set(range(npartitions)):
+                raise RuntimeError(f"Non-contiguous chunk IDs in attribute content index {index_filename}")
+        else:
+            # Legacy generated packages have no index; inspect every chunk.
+            stem = Path(filename)
+            chunk_ids = {int(path.suffix[1:]) for path in stem.parent.glob(stem.name + '.*')
+                         if path.is_file() and path.suffix[1:].isdigit()}
+            npartitions = max(chunk_ids) + 1 if chunk_ids else 0
+            if not chunk_ids or chunk_ids != set(range(npartitions)):
+                raise RuntimeError(f'Missing attribute content chunks for {filename}')
+
         with torch.no_grad():
-            _logger.info(f'loading partitioned model from {filename}, number of model parameter chunks: {npartitions}')
-            attr_names = set(self._fullmap.keys())
-            for file_idx in range(npartitions):
+            required_tids = {meta.tid for meta in self._fullmap.values()}
+            missing_tids = required_tids.difference(tid_to_chunk) if has_index else set()
+            if missing_tids:
+                raise RuntimeError(
+                    f'attribute content index {index_filename} is missing tensor IDs: {sorted(missing_tids)}'
+                )
+            chunk_to_attrs = defaultdict(list)
+            if has_index:
+                for attr_name, meta in self._fullmap.items():
+                    chunk_to_attrs[tid_to_chunk[meta.tid]].append((attr_name, meta))
+            else:
+                chunk_to_attrs = {idx: list(self._fullmap.items()) for idx in range(npartitions)}
+
+            # Only trusted, locally generated attribute chunks use the subclass-
+            # compatible unpickler. The separate integer index stays weights-only.
+            load_options = {'weights_only': False}
+            if TorchVersion(torch.__version__) >= (2, 1):
+                # TP/PP ranks only page in the slices of a full tensor they own.
+                load_options['mmap'] = True
+            loaded_tids = set()
+
+            _logger.info(
+                f'loading partitioned model from {filename}, '
+                f'number of model parameter chunks: {npartitions}, chunks required by this rank: {len(chunk_to_attrs)}'
+            )
+            for file_idx, attrs in sorted(chunk_to_attrs.items()):
                 # part_model contains a subset of attributes, where each attribute is a fulltensor
                 # fulltensor.tid -> torch.Tensor
-                part_model: Dict[int, torch.Tensor] = torch.load(filename + f'.{file_idx}')
-                loaded_name = set()
-                for attr_name in attr_names:
-                    meta = self._fullmap[attr_name]
+                part_model: Dict[int, torch.Tensor] = torch.load(
+                    filename + f'.{file_idx}',
+                    **load_options,
+                )
+                for attr_name, meta in attrs:
                     if meta.tid not in part_model:
-                        continue
+                        if not has_index:
+                            continue
+                        raise RuntimeError(
+                            f'tensor ID {meta.tid} for attribute {attr_name} is not in '
+                            f'{filename}.{file_idx}'
+                        )
                     attr = getattr(self, attr_name)
                     content = part_model[meta.tid][meta.slicers]
                     if meta.val_chunks != 1:
                         content = content / meta.val_chunks
                     attr.copy_(content)
-                    loaded_name.add(attr_name)
-                for name in loaded_name:
-                    attr_names.remove(name)
-            if len(attr_names) != 0:
-                raise RuntimeError(
-                    f'remaining graph parameters / buffers cannot find in model files: {list(attr_names)}')
+                    loaded_tids.add(meta.tid)
+                del part_model
+            if required_tids.difference(loaded_tids):
+                raise RuntimeError(f'Missing tensor IDs in attribute content {filename}: '
+                                   f'{sorted(required_tids.difference(loaded_tids))}')
+
+    def load_np_buffer_content(self, filename: str):
+        """Load non-persistent buffer content from file.
+
+        Only loads attributes that are non-persistent buffers
+        (i.e., in self._non_persistent_buffers_set).
+
+        Args:
+            filename (str): file path to the npbuffer.pt file
+        """
+        if not self._non_persistent_buffers_set:
+            return
+        # Frozen replicas can be as large as the trainable model. Page in only
+        # this rank's slices rather than materializing all PP/EP weights on
+        # every rank when resuming.
+        load_options = {'map_location': 'cpu'}
+        if TorchVersion(torch.__version__) >= (2, 1):
+            load_options['mmap'] = True
+        np_buffer_model: Dict[int, torch.Tensor] = torch.load(filename, **load_options)
+        with torch.no_grad():
+            _logger.info(f'loading non-persistent buffers from {filename}')
+            for attr_name in self._non_persistent_buffers_set:
+                if attr_name not in self._fullmap:
+                    raise RuntimeError(f'non-persistent buffer {attr_name} not found in fullmap.')
+                meta = self._fullmap[attr_name]
+                if meta.tid not in np_buffer_model:
+                    raise RuntimeError(f'non-persistent buffer {attr_name} (tid={meta.tid}) not found in {filename}.')
+                attr = getattr(self, attr_name)
+                content = np_buffer_model[meta.tid][meta.slicers]
+                if meta.val_chunks != 1:
+                    content = content / meta.val_chunks
+                attr.copy_(content)
 
     def init_group(self, ranks: List[int]):
-        if not all([isinstance(rank, int) for rank in ranks]):
+        """Legacy gencode entry; batch its singleton declarations on first use."""
+        if not all(isinstance(rank, int) for rank in ranks):
             raise TypeError("Expected ranks to be List[int]")
-        DeviceGroup().get_group(ranks)
+        manager = DeviceGroup()
+        # Older generated modules declare singleton groups one at a time.
+        # Precreate the partition on their first declaration as well.
+        if len(ranks) == 1 and not manager.group_exists(ranks):
+            manager.init_groups([[rank] for rank in range(manager.world_size)])
+        manager.get_group(ranks)
+
+    def init_groups(self, groups: List[List[int]]):
+        DeviceGroup().init_groups(groups)
+
+    def init_p2p_groups(self, pairs: List[Tuple[int, int]]):
+        DeviceGroup().init_p2p_groups(pairs)
 
     def get_checkpoint(self, optimizer: torch.optim.Optimizer = None):
         state_dict = super().state_dict()
@@ -529,7 +762,9 @@ class CubeModule(torch.nn.Module):
                             raise ValueError("Invalid tensor as a ZeRO3 parameter, expected a 1D tensor.")
                         curr_filled = zero3_current_filled.setdefault(meta.orig_name, {}).setdefault(state_dict_merge_track_id, [])
                         curr_z3_info = zero3_param_metadata[local_name]
-                        curr_start, curr_end = curr_z3_info['start'], curr_z3_info['end']
+                        if isinstance(curr_z3_info, dict):
+                            curr_z3_info = Zero3AttrMeta(**curr_z3_info)
+                        curr_start, curr_end = curr_z3_info.start, curr_z3_info.end
                         fill_len = curr_end - curr_start
                         if (curr_start, curr_end) in curr_filled:
                             # already filled, let's check consistency
@@ -563,14 +798,16 @@ class CubeModule(torch.nn.Module):
         `merge_partial_states` will use this list to build the parameter order
         """
         origin_parameter_names: List[str] = []
+        seen_parameter_names: Set[str] = set()
         for local_fullmap in fullmaps:
             for _, meta in local_fullmap.items():
                 if not meta.is_param: continue
                 # shared parameters in CubeModule is already de-duplicated. So in the
                 # local model state, we will not have multiple parameters sharing with same content
                 # but in different names.
-                if meta.orig_name not in origin_parameter_names:
+                if meta.orig_name not in seen_parameter_names:
                     origin_parameter_names.append(meta.orig_name)
+                    seen_parameter_names.add(meta.orig_name)
         return origin_parameter_names
 
     @classmethod
@@ -637,6 +874,7 @@ class CubeModule(torch.nn.Module):
         # help understand the whole logic. In other words, the real plan_ngpus is <= len(model_state_dicts).
         plan_ngpus = len(model_state_dicts)
         # gather model states
+        _logger.info('start merge model states')
         full_model_state_dict = cls.merge_model_state_dicts(model_state_dicts, fullmaps[0: plan_ngpus], zero_idx_maps)
         _logger.info('finish merge model states')
         if optim_state_dicts is None:
@@ -670,6 +908,24 @@ class CubeModule(torch.nn.Module):
 
         # we follow the order of in origin parameter names to find each (partitioned)
         # parameter in the local model state, and assign the slice to the position.
+        # Index the local optimizer positions and shard coverage once. Buffers
+        # do not consume optimizer indices, even when interleaved with parameters.
+        param_entries = defaultdict(list)
+        expected_tracks = defaultdict(set)
+        for worker_idx, fullmap in enumerate(fullmaps):
+            local_index = 0
+            for meta in fullmap.values():
+                if not meta.is_param:
+                    continue
+                track_id = tuple((s.start, s.step, s.stop) for s in meta.slicers)
+                # Omitted optimizer ranks may be replicas, but they may also
+                # own a missing spatial shard. Coverage comes from all metadata;
+                # only supplied states can contribute entries to the merge.
+                if worker_idx < plan_ngpus:
+                    param_entries[meta.orig_name].append((worker_idx, local_index, meta, track_id))
+                expected_tracks[meta.orig_name].add(track_id)
+                local_index += 1
+
         full_optim_state_dict['state'] = {}
         full_states = full_optim_state_dict['state']
 
@@ -685,8 +941,18 @@ class CubeModule(torch.nn.Module):
             return all(bucket_state[key].shape == bucket_state[opt_state_keys[0]].shape
                         for key in opt_state_keys)
 
-        def _retrieve_param_opt_state(bucket_states, pstart, pend, pshape, bucket_size, zero_version):
+        def _retrieve_param_opt_state(bucket_states, pstart, pend, pshape, bucket_size, zero_version,
+                                      zero3_ranges=None):
             assert bucket_size % len(bucket_states) == 0
+            for other in bucket_states[1:]:
+                if other.keys() != bucket_states[0].keys():
+                    raise ValueError('Inconsistent optimizer state keys within a ZeRO bucket')
+                if 'step' in other and not cls._safe_tensor_equal(other['step'], bucket_states[0]['step']):
+                    raise ValueError('Conflicting optimizer state step within a ZeRO bucket')
+                for key in other.keys() - {'step'}:
+                    if (other[key].shape != bucket_states[0][key].shape
+                            or other[key].dtype != bucket_states[0][key].dtype):
+                        raise ValueError('Inconsistent optimizer state tensors within a ZeRO bucket')
             opt_state_keys = list(bucket_states[0].keys())
             if 'step' in bucket_states[0]:
                 opt_state_keys.remove('step')
@@ -718,35 +984,65 @@ class CubeModule(torch.nn.Module):
                             opt_states_1d[key][offset:] = bucket_states[end_rank_id][key][:end_offset]
             else:  # zero_version == 3
                 assert zero_version > 1, f'unsupported zero version {zero_version}'
+                param_numel = math.prod(pshape)
+                chunk_size = pend - pstart
+                if zero3_ranges is None:
+                    # Legacy metadata describes one ZeRO subgroup, including
+                    # ranks whose entire chunk is padding. Never wrap those
+                    # ranks around to the beginning of the real parameter.
+                    zero3_ranges = [(rank * chunk_size, min((rank + 1) * chunk_size, param_numel))
+                                    for rank in range(len(bucket_states))]
+                for start, end in zero3_ranges:
+                    if (start < 0 or end != min(start + chunk_size, param_numel)):
+                        raise ValueError(f'Invalid ZeRO-3 optimizer state range {(start, end)} for shape {pshape}')
+                ordered_states = sorted(zip(zero3_ranges, bucket_states), key=lambda item: item[0])
                 for key in opt_state_keys:
-                    fill_start = 0
-                    fill_len = pend - pstart
-                    param_numel = opt_states_1d[key].numel()
-                    for bstate in bucket_states:
-                        if fill_start >= param_numel:
-                            # from current implementation, code never goes here
-                            # because we have used model_idx2opt_idx to filter out unnecessary ranks
-                            # but let's keep the logic here for safety
-                            fill_start = fill_start % param_numel
-                            if fill_start + fill_len > param_numel:
-                                fill_len = param_numel - fill_start
-                            # check consistency for the already filled part
-                            if not cls._safe_tensor_equal(
-                                opt_states_1d[key][fill_start: fill_start + fill_len],
-                                bstate[key][pstart: pstart+fill_len]
-                            ):
-                                raise ValueError(f"Conflict in merging optimizer state for param with shape {pshape}")
-                        else:
-                            if fill_start + fill_len > param_numel:
-                                fill_len = param_numel - fill_start
-                            # remove padding part
-                            opt_states_1d[key][fill_start: fill_start + fill_len] = bstate[key][pstart: pstart+fill_len]
-                        fill_start += fill_len
+                    covered_end = 0
+                    for (start, end), bstate in ordered_states:
+                        if bstate[key].ndim != 1 or not 0 <= pstart <= pend <= bstate[key].numel():
+                            raise ValueError('Invalid ZeRO-3 optimizer state bucket size')
+                        if start >= param_numel:
+                            continue  # this rank holds only padding for this parameter
+                        if start > covered_end:
+                            raise ValueError(f'Incomplete optimizer state for param with shape {pshape}')
+                        overlap_end = min(end, covered_end)
+                        if start < overlap_end and not cls._safe_tensor_equal(
+                            opt_states_1d[key][start:overlap_end],
+                            bstate[key][pstart:pstart + overlap_end - start],
+                        ):
+                            raise ValueError(f'Conflict in merging optimizer state for param with shape {pshape}')
+                        if end > covered_end:
+                            opt_states_1d[key][covered_end:end] = bstate[key][pstart + covered_end - start:pstart + end - start]
+                            covered_end = end
+                    if covered_end != param_numel:
+                        raise ValueError(f'Incomplete optimizer state for param with shape {pshape}')
 
             if 'step' in bucket_states[0]:
                 # make sure all steps are different tensors (with same value)
-                opt_states['step'] = bucket_states[0]['step'].cpu().clone()
+                step = bucket_states[0]['step']
+                opt_states['step'] = step.cpu().clone() if isinstance(step, torch.Tensor) else step
             return opt_states
+
+        zero3_layouts = {}
+
+        def _zero3_layout(rank):
+            # Index once per rank, including buffers in neither parameter
+            # positions nor shard identity. This also works before #125's
+            # separate optimizer traversal optimization.
+            if rank not in zero3_layouts:
+                metadata = zero_idx_maps[rank][3] if len(zero_idx_maps[rank]) == 4 else None
+                if metadata is None:
+                    zero3_layouts[rank] = None
+                else:
+                    order, by_shard = [], {}
+                    for name, meta in fullmaps[rank].items():
+                        if meta.is_param:
+                            identity = (meta.orig_name, tuple((s.start, s.stop, s.step) for s in meta.slicers))
+                            order.append(identity)
+                            info = metadata.get(name)
+                            by_shard[identity] = Zero3AttrMeta(**info) if isinstance(info, dict) else info
+                    zero3_layouts[rank] = order, by_shard
+            return zero3_layouts[rank]
 
         def _merge_opt_zero(param_shape, worker_idx, param_idx):
             if len(zero_idx_maps[worker_idx]) == 4:
@@ -761,7 +1057,7 @@ class CubeModule(torch.nn.Module):
             if isinstance(opt_idx, int):
                 # the param without reducer
                 assert opt_idx2ranks[opt_idx] is None
-                return optim_state_dicts[worker_idx]['state'][opt_idx]
+                return optim_state_dicts[worker_idx]['state'].get(opt_idx)
             else:
                 # the param in reducer bucket
                 opt_idx, pstart, pend, pshape = opt_idx
@@ -769,19 +1065,40 @@ class CubeModule(torch.nn.Module):
                     assert param_shape == pshape, f'param shape {param_shape} vs pshape {pshape}'
                 ranks, bucket_size = opt_idx2ranks[opt_idx]
                 # parameters in reducer come first, so we can directly use opt_idx to index.
+                state_presence = [0 <= rank < plan_ngpus and bool(optim_state_dicts[rank]['state'].get(opt_idx))
+                                  for rank in ranks]
+                if not any(state_presence):
+                    return None
+                if not all(state_presence):
+                    raise ValueError(f'Inconsistent optimizer state for bucket {opt_idx}: '
+                                     f'expected ranks {ranks}')
                 bucket_states = [optim_state_dicts[rank]['state'][opt_idx] for rank in ranks]
+                zero3_ranges = None
+                if zero_version > 1:
+                    layouts = [_zero3_layout(rank) for rank in ranks]
+                    if any(layout is not None for layout in layouts):
+                        source_layout = _zero3_layout(worker_idx)
+                        if source_layout is None or any(layout is None for layout in layouts):
+                            raise ValueError('Incomplete ZeRO-3 optimizer state metadata')
+                        identity = source_layout[0][param_idx]
+                        infos = [layout[1].get(identity) for layout in layouts]
+                        if any(info is None or info.chunk_size != pend - pstart for info in infos):
+                            raise ValueError('Inconsistent ZeRO-3 optimizer state metadata')
+                        zero3_ranges = [(info.start, info.end) for info in infos]
                 return _retrieve_param_opt_state(
                     bucket_states,
                     pstart,
                     pend,
                     param_shape,
                     bucket_size,
-                    zero_version
+                    zero_version,
+                    zero3_ranges,
                 )
 
         # full_index: param IDs in the full optimizer state
         for full_index, param_name in enumerate(origin_parameter_names):
             _logger.info(f'start to handle optimizer state for param {param_name} with full_index {full_index}')
+            expected_state_tracks = expected_tracks[param_name]
             # zero_done_track is used to avoid re-merging the same parameter
             # in the optimizer state
             # zero_done_track_id: slicers
@@ -798,68 +1115,71 @@ class CubeModule(torch.nn.Module):
             # consequently, the parameter's optimizer state is also sharded.
             # This for loop is for merging the sharded parameter's optimizer state
             # into its original full state (i.e., the non-partitioned one).
-            for work_idx, (optim_state, fullmap) in enumerate(zip(optim_state_dicts[0 : plan_ngpus], fullmaps[0 : plan_ngpus])):
-                if 'state' not in optim_state: continue
-                # adam-like optimizers have optim_state['state']={} before any optimizer.step()
-                if not optim_state['state']: continue
-                # filter out non-param attributes as they don't appear in the optimizer state
-                param_fullmap = [meta for meta in fullmap.values() if meta.is_param]
-                # local index: param IDs in the local optimizer state, we assume
-                # it aligns with the order of local `model.parameters()`
-                for local_index, meta in enumerate(param_fullmap):
-                    if meta.orig_name != param_name: continue
-                    full_states.setdefault(full_index, {})
-
-                    # TODO: support customized param groups, where each parameter has IDs
-                    # specified from its own param_group
-                    track_id = tuple((i.start, i.step, i.stop) for i in meta.slicers)
-                    if zero_idx_maps is None:
-                        states: Dict[str, torch.Tensor] = optim_state['state'][local_index]
+            for work_idx, local_index, meta, track_id in param_entries[param_name]:
+                optim_state = optim_state_dicts[work_idx]
+                if not optim_state.get('state'):
+                    continue
+                # TODO: support customized param groups, where each parameter has IDs
+                # specified from its own param_group
+                if zero_idx_maps is None:
+                    states: Dict[str, torch.Tensor] = optim_state['state'].get(local_index)
+                else:
+                    if track_id not in zero_done_track:
+                        # As ZeRO is applied, the optimizer state of this parameter (a shard)
+                        # may not be stored locally in its optimizer state.
+                        # _merge_opt_zero is for recovering the optimizer state corresponding to this parameter shard.
+                        states: Dict[str, torch.Tensor] = _merge_opt_zero(meta.sub_shape, work_idx, local_index)
                     else:
-                        if track_id not in zero_done_track:
-                            # As ZeRO is applied, the optimizer state of this parameter (a shard)
-                            # may not be stored locally in its optimizer state.
-                            # _merge_opt_zero is for recovering the optimizer state corresponding to this parameter shard.
-                            states: Dict[str, torch.Tensor] = _merge_opt_zero(meta.sub_shape, work_idx, local_index)
-                            zero_done_track.add(track_id)
+                        _logger.debug(f'rank {work_idx}: skip merging duplicated optimizer state for param {full_index} with slicers {meta.slicers}')
+                        continue
+
+                if not states:
+                    continue
+                zero_done_track.add(track_id)
+                if full_index in full_states and full_states[full_index].keys() != states.keys():
+                    raise ValueError(f'Inconsistent optimizer state keys for parameter {param_name}')
+                full_states.setdefault(full_index, {})
+                for state_name in states.keys():
+                    value = states[state_name]
+                    # special handle for step: scalar tensor type
+                    if state_name == 'step':
+                        if state_name in full_states[full_index]:
+                            if not cls._safe_tensor_equal(full_states[full_index][state_name], value):
+                                raise ValueError(f"Conflict in merging {param_name}.{state_name} from rank {work_idx}")
                         else:
-                            _logger.debug(f'rank {work_idx}: skip merging duplicated optimizer state for param {full_index} with slicers {meta.slicers}')
-                            continue
+                            full_states[full_index][state_name] = value.cpu() if isinstance(value, torch.Tensor) else value
+                        continue
 
-                    for state_name in states.keys():
-                        value = states[state_name]
-                        # special handle for step: scalar tensor type
-                        if state_name == 'step':
-                            if state_name in full_states[full_index]:
-                                if not cls._safe_tensor_equal(full_states[full_index][state_name], value):
-                                    raise ValueError(f"Conflict in merging {param_name}.{state_name} from rank {work_idx}")
-                            else:
-                                full_states[full_index][state_name] = value.cpu()
-                            continue
-
-                        # for non-tensor states
-                        if not isinstance(value, torch.Tensor):
-                            if state_name in full_states[full_index]:
-                                if full_states[full_index][state_name] != value:
-                                    raise ValueError(f"Conflict in merging {param_name}.{state_name} from rank {work_idx}")
-                            else:
-                                full_states[full_index][state_name] = value
-                                _logger.debug(f'non-tensor state {state_name} is merged for {full_index}')
-                        # for tensor states, like 'exp_avg'
+                    # for non-tensor states
+                    if not isinstance(value, torch.Tensor):
+                        if state_name in full_states[full_index]:
+                            if full_states[full_index][state_name] != value:
+                                raise ValueError(f"Conflict in merging {param_name}.{state_name} from rank {work_idx}")
                         else:
-                            # create optimizer state tensor
-                            if state_name not in full_states[full_index]:
-                                full_states[full_index][state_name] = torch.empty(meta.shape, dtype=value.dtype, device='cpu')
+                            full_states[full_index][state_name] = value
+                            _logger.debug(f'non-tensor state {state_name} is merged for {full_index}')
+                    # for tensor states, like 'exp_avg'
+                    else:
+                        if tuple(value.shape) != tuple(meta.sub_shape):
+                            raise ValueError(f'Invalid optimizer state shape for {param_name}.{state_name}')
+                        # create optimizer state tensor
+                        if state_name not in full_states[full_index]:
+                            full_states[full_index][state_name] = torch.empty(meta.shape, dtype=value.dtype, device='cpu')
+                        elif full_states[full_index][state_name].dtype != value.dtype:
+                            raise ValueError(f'Conflicting optimizer state dtype for {param_name}.{state_name}')
 
-                            if track_id in state_merge_track:
-                                if not cls._safe_tensor_equal(full_states[full_index][state_name][meta.slicers], value):
-                                    raise ValueError(f"Conflict in merging {param_name}.{state_name} from rank {work_idx}")
-                            else:
-                                # assign with partial tensor
-                                full_states[full_index][state_name][meta.slicers] = value
+                        if track_id in state_merge_track:
+                            if not cls._safe_tensor_equal(full_states[full_index][state_name][meta.slicers], value):
+                                raise ValueError(f"Conflict in merging {param_name}.{state_name} from rank {work_idx}")
+                        else:
+                            # assign with partial tensor
+                            full_states[full_index][state_name][meta.slicers] = value
 
-                    state_merge_track.add(track_id)
+                state_merge_track.add(track_id)
 
+            if full_index in full_states and state_merge_track != expected_state_tracks:
+                raise ValueError(f'Incomplete optimizer state for parameter {param_name}: '
+                                 f'found slices {state_merge_track}, expected {expected_state_tracks}')
         # handle additional state dict keys
         for optim_state_dict in optim_state_dicts[0 : plan_ngpus]:
             for key in optim_state_dict.keys():
@@ -868,7 +1188,8 @@ class CubeModule(torch.nn.Module):
                         _logger.info(f'overwrite optimizer state key {key}')
                     else:
                         _logger.info(f'inherit optimizer state key {key}')
-                    full_optim_state_dict[key] = optim_state_dict[key]
+                    full_optim_state_dict[key] = (copy.deepcopy(optim_state_dict[key])
+                                                 if key == 'param_groups' else optim_state_dict[key])
 
         # reset the param_groups params to the full parameter list
         if 'param_groups' in full_optim_state_dict:  # for backward compatibility
@@ -982,7 +1303,7 @@ class CubeModule(torch.nn.Module):
             raise ValueError(f'nnscaler does not support passing dtype {dtype} to to()')
         if convert_to_format is not None:
             raise ValueError(f'nnscaler does not support passing convert_to_format {convert_to_format} to to()')
-        if non_blocking is not None:
+        if non_blocking:
             warnings.warn(f'nnscaler moves tensors in a blocking approach currently')
 
         # after _parse_to `device` must in type of torch.device
@@ -1048,6 +1369,8 @@ class ParallelModule(CubeModule):
     EXTRA_STATE_KEY = 'CUBE_EXTRA_STATE'
     ATTR_META_FILE_PREFIX = 'attr_meta'
     ATTR_META_FILE_TEMPLATE = ATTR_META_FILE_PREFIX + '{}.pkl'  # 'attr_meta{}.pkl'
+    ATTR_META_FILE = ATTR_META_FILE_PREFIX + '.pkl'
+    ATTR_META_FORMAT_VERSION = 1
 
     # the rank of the module, will be assigned in the generated subclasses
     rank: int
@@ -1108,15 +1431,8 @@ class ParallelModule(CubeModule):
         from nnscaler.parallel import ComputeConfig
 
         super().__init_subclass__(**kwargs)
-        cls.attr_meta_maps = []
         cls.module_dir = Path(sys.modules[cls.__module__].__file__).parent
-
-        for rank in range(cls.world_size):
-            attr_map_file = cls.module_dir / cls.ATTR_META_FILE_TEMPLATE.format(rank)
-            with open(attr_map_file, 'rb') as f:
-                attr_meta_map = pickle.load(f)
-                attr_meta_map = {attr: AttrMeta(**meta) for attr, meta in attr_meta_map.items()}
-                cls.attr_meta_maps.append(attr_meta_map)
+        cls.attr_meta_maps = cls._load_attr_meta_maps(cls.module_dir, cls.world_size)
 
         cls.dist_param_map = torch.load(cls.module_dir / FxModuleParser.ATTR_MAP_FILE, weights_only=False)
         cls.compute_config = ComputeConfig.safe_load_from_file(
@@ -1124,6 +1440,69 @@ class ParallelModule(CubeModule):
             return_none_on_error=False
         )
         cls.origin_module_metadata = torch.load(cls.module_dir / cls.ORIGIN_MODULE_METADATA_FILE, weights_only=False)
+
+    @staticmethod
+    def _normalize_attr_meta_map(attr_meta_map: Any, source: Path) -> dict[str, AttrMeta]:
+        if not isinstance(attr_meta_map, dict):
+            raise RuntimeError(f'Invalid attribute metadata map in {source}: expected a dictionary')
+        try:
+            return {
+                attr: meta if isinstance(meta, AttrMeta) else AttrMeta(**meta)
+                for attr, meta in attr_meta_map.items()
+            }
+        except (TypeError, KeyError) as exc:
+            raise RuntimeError(f'Invalid attribute metadata map in {source}') from exc
+
+    @classmethod
+    def _load_attr_meta_maps(cls, module_dir: Path, world_size: int) -> list[dict[str, AttrMeta]]:
+        """Load compact metadata when present, with legacy per-rank shard fallback."""
+        compact_file = module_dir / cls.ATTR_META_FILE
+        if not compact_file.exists():
+            attr_meta_maps = []
+            for rank in range(world_size):
+                attr_map_file = module_dir / cls.ATTR_META_FILE_TEMPLATE.format(rank)
+                with attr_map_file.open('rb') as stream:
+                    attr_meta_map = pickle.load(stream)
+                attr_meta_maps.append(cls._normalize_attr_meta_map(attr_meta_map, attr_map_file))
+            return attr_meta_maps
+
+        with compact_file.open('rb') as stream:
+            compact_meta = pickle.load(stream)
+        if not isinstance(compact_meta, dict):
+            raise RuntimeError(f'Invalid compact attribute metadata in {compact_file}: expected a dictionary')
+        if compact_meta.get('version') != cls.ATTR_META_FORMAT_VERSION:
+            raise RuntimeError(
+                f'Unsupported compact attribute metadata version in {compact_file}: '
+                f"{compact_meta.get('version')!r}"
+            )
+
+        unique_payloads = compact_meta.get('unique_payloads')
+        rank_to_variant = compact_meta.get('rank_to_variant')
+        if not isinstance(unique_payloads, list) or not all(isinstance(payload, bytes) for payload in unique_payloads):
+            raise RuntimeError(f'Invalid unique payloads in compact attribute metadata {compact_file}')
+        if not isinstance(rank_to_variant, list) or len(rank_to_variant) != world_size:
+            raise RuntimeError(
+                f'Compact attribute metadata world size mismatch in {compact_file}: '
+                f'expected {world_size}, got '
+                f'{len(rank_to_variant) if isinstance(rank_to_variant, list) else type(rank_to_variant).__name__}'
+            )
+        if any(
+            isinstance(variant, bool)
+            or not isinstance(variant, int)
+            or variant < 0
+            or variant >= len(unique_payloads)
+            for variant in rank_to_variant
+        ):
+            raise RuntimeError(f'Invalid rank-to-variant index in compact attribute metadata {compact_file}')
+
+        unique_maps = []
+        for payload in unique_payloads:
+            try:
+                attr_meta_map = pickle.loads(payload)
+            except Exception as exc:
+                raise RuntimeError(f'Invalid payload in compact attribute metadata {compact_file}') from exc
+            unique_maps.append(cls._normalize_attr_meta_map(attr_meta_map, compact_file))
+        return [unique_maps[variant] for variant in rank_to_variant]
 
     @property
     def non_presistent_buffers_inited(self):
@@ -1166,6 +1545,14 @@ class ParallelModule(CubeModule):
         module_file = Path(sys.modules[self.__module__].__file__)
         if init_params:
             self.load_attr_content(str(module_file.with_name(f"{FxModuleParser.ATTR_CONTENT_FILE_STEM}")))
+        elif self._non_persistent_buffers_set:
+            # When init_params=False, only load non-persistent buffers from the small npbuffer.pt file.
+            # This avoids loading the large fullmodel.pt files when resuming from checkpoint,
+            # since checkpoint will provide the rest of the parameters/buffers.
+            np_buffer_file = module_file.with_name(FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
+            if np_buffer_file.is_file():
+                self.load_np_buffer_content(str(np_buffer_file))
+                self._non_presistent_buffers_inited = True
 
         self._warn_uninitialized_non_persistent_buffers()
 
@@ -1327,6 +1714,16 @@ class ParallelModule(CubeModule):
             raise ValueError(f"Rank {rank} is out of range [0, {cls.world_size})")
         return cls.attr_meta_maps[rank]
 
+    def set_grad_accumulation_steps(self, steps: int):
+        """
+        Set the number of gradient accumulation steps for the module.
+
+        Args:
+            steps (int): the number of gradient accumulation steps
+        """
+        for reducer in self._reducers:
+            reducer.grad_accumulation_steps = steps
+
     def forward(self, *args, **kwargs):
         self._warn_uninitialized_non_persistent_buffers(raise_error=True)
         if self.training:
@@ -1411,8 +1808,6 @@ class ParallelModule(CubeModule):
             for idx in range(len(outs)):
                 # loss always requires to be a scalar, and its gradient should be None
                 if grads[idx] is None:
-                    assert idx == 0, "Loss must be the first output."
-
                     if is_dummy_batch and accum_idx >= len(is_dummy_batch):
                         raise RuntimeError(
                             f"Expected {len(is_dummy_batch)} number of micro-batches, but got more than it."
@@ -1465,6 +1860,7 @@ class ParallelModule(CubeModule):
         self._sync_grad_required = False
         sample_count = len(samples)
         dataloader = microbatches(samples, cycle=False)
+        self.set_grad_accumulation_steps(sample_count)
 
         if self.use_scheduler:
             if len(samples) != self.nmicros_per_scheduler_step:
@@ -1668,7 +2064,7 @@ class ParallelModule(CubeModule):
         else:
             for hook in self._load_state_dict_pre_hooks.values():
                 hook(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
-            new_missing_keys = self.load_merged_state_dict(state_dict, prefix, strict=False)
+            new_missing_keys = load_merged_module(self, state_dict, prefix, strict=False)
             if strict:
                 missing_keys.extend(new_missing_keys)
 

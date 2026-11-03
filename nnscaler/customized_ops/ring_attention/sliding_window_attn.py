@@ -1,6 +1,7 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+from dataclasses import replace
 from typing import Tuple, List, Dict, Optional
 import torch
 from torch import Tensor
@@ -15,7 +16,8 @@ from .core.sliding_window_attn_implementation import (
     prepare_sliding_window_metadata,
     sliding_window_attn_func,
 )
-from .core.utils import gen_head_anno
+from .core.utils import call_flash_attn_cute_varlen_func, gen_head_anno, get_arg_by_name
+from .varlen_utils import select_sequence_group_cu_seqlens
 
 try:
     from flash_attn.cute import flash_attn_varlen_func as flash_attn_cute_varlen_func
@@ -39,9 +41,11 @@ def wrap_sliding_window_attn_func(
         enable_ring: bool = True,
         use_cute: bool = False,
         process_group: Tuple[int] = None,
+        sequence_parallel_size: int = None,
+        sequence_group_count: int = 1,
+        return_lse: bool = False,
         max_seqlen_q: Optional[int] = None,
         max_seqlen_k: Optional[int] = None,
-        return_lse: bool = True,
 ):
     '''
     Context parallel sliding window attention using single-hop A2A communication.
@@ -56,6 +60,27 @@ def wrap_sliding_window_attn_func(
     - window_size[0] <= length_per_rank (single-hop communication)
     '''
     assert not return_attn_probs, "return_attn_probs is not supported"
+    if int(sequence_group_count) < 1:
+        raise ValueError("sequence_group_count must be >= 1")
+    selected_sequence_group = False
+    if process_group is not None and enable_ring:
+        if sequence_parallel_size is not None and len(process_group) != sequence_parallel_size:
+            raise ValueError(
+                f"Generated process group size {len(process_group)} does not match "
+                f"sequence_parallel_size={sequence_parallel_size}"
+            )
+        # Single-rank groups also select their metadata on the local FA path.
+        if int(sequence_group_count) > 1:
+            cu_seqlens_q = select_sequence_group_cu_seqlens(
+                cu_seqlens_q, process_group, sequence_group_count)
+            cu_seqlens_k = select_sequence_group_cu_seqlens(
+                cu_seqlens_k, process_group, sequence_group_count)
+            selected_sequence_group = True
+    if selected_sequence_group:
+        # PP down-sampling selects lane-local metadata here, so caller-provided
+        # maxima for the unselected metadata are no longer valid.
+        max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
+        max_seqlen_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
     if max_seqlen_q is None:
         max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
     if max_seqlen_k is None:
@@ -65,7 +90,8 @@ def wrap_sliding_window_attn_func(
         if use_cute:
             assert flash_attn_cute_varlen_func is not None, "flash_attn.cute is not available"
             cute_window_size = tuple(None if w == -1 else w for w in window_size)
-            output, softmax_lse = flash_attn_cute_varlen_func(
+            return call_flash_attn_cute_varlen_func(
+                flash_attn_cute_varlen_func,
                 q, k, v,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
@@ -75,11 +101,10 @@ def wrap_sliding_window_attn_func(
                 causal=causal,
                 window_size=cute_window_size,
                 deterministic=deterministic,
-                return_lse=True,
+                return_lse=return_lse,
             )
-            return (output, softmax_lse) if return_lse else output
         else:
-            output, softmax_lse, _ = flash_attn_varlen_func(
+            result = flash_attn_varlen_func(
                 q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                 dropout_p=dropout_p,
                 softmax_scale=softmax_scale,
@@ -87,9 +112,12 @@ def wrap_sliding_window_attn_func(
                 window_size=window_size,
                 alibi_slopes=alibi_slopes,
                 deterministic=deterministic,
-                return_attn_probs=True,
+                return_attn_probs=bool(return_lse),
             )
-            return (output, softmax_lse) if return_lse else output
+            if return_lse:
+                output, softmax_lse, _ = result
+                return output, softmax_lse
+            return result
 
     assert causal, "sliding window CP attention requires causal=True"
     assert window_size[0] > 0, (
@@ -119,6 +147,15 @@ def wrap_sliding_window_attn_func(
         rank=local_rank,
         world_size=local_world_size,
     )
+
+    # Only the maxima consumed by FA4 are replaced; communication metadata is
+    # still derived from the exact packed batch.
+    if use_cute:
+        metadata = replace(
+            metadata,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+        )
 
     out, softmax_lse = sliding_window_attn_func(
         q,
@@ -160,7 +197,27 @@ def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_d
     else:
         if partition_dims[0][0] == 0:  # partition on sequence dim
             num = partition_dims[0][1]
-            scale_unit_dev_ids = [local_rank + offset for local_rank in range(remainder // num * num, (remainder // num + 1) * num)]
+            configured_group_size = kwargs.get('sequence_parallel_size')
+            group_size = (
+                num if configured_group_size in (None, 'None')
+                else int(configured_group_size)
+            )
+            if group_size < 1 or num % group_size != 0:
+                raise ValueError(
+                    f'sequence_parallel_size must divide the sequence partition degree, '
+                    f'got sequence_parallel_size={group_size}, partition_degree={num}')
+            group_count = int(kwargs.get('sequence_group_count', '1'))
+            if group_count != num // group_size:
+                raise ValueError(
+                    f'sequence_group_count must equal partition_degree // sequence_parallel_size, '
+                    f'got sequence_group_count={group_count}, partition_degree={num}, '
+                    f'sequence_parallel_size={group_size}')
+            partition_start = remainder // num * num
+            group_start = partition_start + (remainder % num) // group_size * group_size
+            scale_unit_dev_ids = [
+                local_rank + offset
+                for local_rank in range(group_start, group_start + group_size)
+            ]
             kw_pairs.append(f"process_group={scale_unit_dev_ids}")
         elif partition_dims[0][0] == 1:
             kw_pairs.append("process_group=None")
@@ -174,7 +231,24 @@ def emit_ring(node: IRDimops, args: List[str], kwargs: Dict[str, str], runtime_d
 def flash_attention_anno(query_states, key_states, value_states, cu_seqlens_q, cu_seqlens_k, alibi_slopes, *args, **kwargs) -> str:
     q_anno, kv_anno = gen_head_anno(query_states, key_states, value_states, head_pos=1)
     alibi_anno = f'{q_anno}' if isinstance(alibi_slopes, IRTensor) else '?'
-    return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, {alibi_anno} -> l {q_anno} vd^, ?'
+    output_anno = f'l {q_anno} vd^'
+    return_lse = get_arg_by_name(
+        wrap_sliding_window_attn_func,
+        "return_lse",
+        False,
+        query_states,
+        key_states,
+        value_states,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        alibi_slopes,
+        *args,
+        **kwargs,
+    )
+    if return_lse:
+        # return_lse=True is annotated as a real tensor output: [num_heads, total_q].
+        output_anno += f', {q_anno} l'
+    return f'l {q_anno} hd^, l {kv_anno} hd^, l {kv_anno} vd^, e^, e^, {alibi_anno} -> {output_anno}'
 
 
 def input_gen_fn(node: IRDimops):

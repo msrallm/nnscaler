@@ -184,6 +184,8 @@ class HybridOptimizer(torch.optim.Optimizer, TrainHookHost, TrainHook):
 
         for idx, opt_config in enumerate(config.optimizers):
             param_groups = opt_param_groups[idx]
+            if not param_groups:
+                param_groups[0] = {'params': []}
             if len(param_groups) > 1:
                 if len(param_groups) != len(opt_config.param_groups):
                     raise ValueError(f"Expected {len(opt_config.param_groups)} param groups, got {len(param_groups)}")
@@ -197,7 +199,7 @@ class HybridOptimizer(torch.optim.Optimizer, TrainHookHost, TrainHook):
                     raise ValueError(f"Expected at most 1 param group, got {len(opt_config.param_groups)}")
                 if opt_config.param_groups:
                     param_groups[0].update(opt_config.param_groups[0].options)
-            optimizer = opt_config.type(param_groups.values(), **opt_config.options)
+            optimizer = opt_config.type(list(param_groups.values()), **opt_config.options)
             self.optimizers.append(optimizer)
 
         # map from param global index to (optimizer_idx, param_idx)

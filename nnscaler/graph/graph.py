@@ -16,7 +16,7 @@ import copy
 import dill
 import hashlib
 
-from nnscaler.ir.cten import IRTensor, IRCell, IRObject
+from nnscaler.ir.cten import IRTensor, IRCell, IRObject, IR
 from nnscaler.ir.unique import IDGenerator
 from nnscaler.ir.operator import IRBpOperation, IRFwOperation, IRDataOperation
 from nnscaler.ir.tensor import IRFullTensor, IRSubTensor, ValueMap
@@ -25,7 +25,7 @@ from nnscaler.graph.function.function import Identity
 from nnscaler.graph.function.anchor import IRGraphAnchor
 from nnscaler.graph.function.pyfunc import IRPyFunc
 from nnscaler.graph.function.dimops import IRDimops, OpAnno
-from nnscaler.graph.segment import IRSegment
+from nnscaler.graph.segment import IRSegment, IRSegmentExpander
 
 from nnscaler.algorithm.generics import GenericDistAlgo
 
@@ -47,6 +47,7 @@ class IRGraph(IRSegment):
         super().__init__(nodes, inputs, outputs, module_name)
 
         self._sched = None  # the schedule strategy
+        self._expander = None  # the graph expander
 
     @property
     def train(self) -> bool:
@@ -56,6 +57,14 @@ class IRGraph(IRSegment):
         @return train bool: True if backward is required, otherwise False (inference only).
         """
         return any(not n.isfw() for n in reversed(self._nodes))
+
+    @property
+    def expander(self) -> 'IRGraphExpander':
+        return self._expander
+
+    @expander.setter
+    def expander(self, expander: 'IRGraphExpander'):
+        self._expander = expander
 
     # ================ Deep Learning Interfalce ======================
 
@@ -970,24 +979,30 @@ class IRGraph(IRSegment):
                     return idx
             return None
 
-        def insert_identity(tensor: IRSubTensor, sid: int) -> IRFwOperation:
+        def insert_identity(tensor: Union[IRTensor, IRObject], sid: int) -> IRFwOperation:
             fwop = Identity(tensor)
-            output = tensor.parent.like().tosub()
-            fwop.set_output(0, output)
-            if tensor.requires_grad:
-                # set input grad
-                igrad = tensor.parent.grad.select(tensor.indmap, tensor.valmap)
-                fwop.input(0).grad = igrad
-                # set output grad
-                otensor = fwop.output(0).parent
-                ograd = otensor.grad.select(tensor.indmap, (0,1))
-                fwop.output(0).grad = ograd
-                # insert identity
-                fidx = self.index(fstages[sid][0])
-                self.finsert(fwop, fidx)
-            else:
+            if not isinstance(tensor, IRTensor):
+                output = tensor.like()
+                fwop.set_output(0, output)
                 fidx = self.index(fstages[sid][0])
                 self.insert(fwop, fidx)
+            else:
+                output = tensor.parent.like().tosub()
+                fwop.set_output(0, output)
+                if tensor.requires_grad:
+                    # set input grad
+                    igrad = tensor.parent.grad.select(tensor.indmap, tensor.valmap)
+                    fwop.input(0).grad = igrad
+                    # set output grad
+                    otensor = fwop.output(0).parent
+                    ograd = otensor.grad.select(tensor.indmap, (0,1))
+                    fwop.output(0).grad = ograd
+                    # insert identity
+                    fidx = self.index(fstages[sid][0])
+                    self.finsert(fwop, fidx)
+                else:
+                    fidx = self.index(fstages[sid][0])
+                    self.insert(fwop, fidx)
             # update stage op group
             fstages[sid].insert(0, fwop)
             if isinstance(fwop.mirror, IRCell):
@@ -995,64 +1010,75 @@ class IRGraph(IRSegment):
             return fwop
 
         # create identity op for cross-stage dataflow
-        for ftensor in self.full_tensors():
-            if ftensor.is_grad() or ftensor.is_attr(): continue
-            if len(self.consumers(ftensor)) == 0: continue
+        for fobj in self.full_objects():
+            if fobj.is_attr(): continue
+            if isinstance(fobj, IRTensor) and fobj.is_grad(): continue
+            if len(self.consumers(fobj)) == 0: continue
+            # only dataloader output has no producer.
+            # we can skip them as they are expected to be in the first stage
+            # and won't cause cross-stage dataflow.
+            if len(self.producers(fobj)) == 0: continue
 
-            assert len(self.producers(ftensor)) <= 1, \
+            assert len(self.producers(fobj)) <= 1, \
                 "The staging interface should be called before any operator partition."
-            ctensors = self.ctensors(ftensor)
-            if len(self.ctensors(ftensor)) > 0:
+            ctensors = self.ctensors(fobj)
+            if len(self.ctensors(fobj)) > 0:
                 assert all(ctensor == ctensors[0] for ctensor in ctensors), (
                     "The staging interface should be called before any operator partition."
                 )
 
-            producer, ptensor = self.producers(ftensor)[0], self.ptensors(ftensor)[0]
+            producer, pobj = self.producers(fobj)[0], self.ptensors(fobj)[0]
             psid = get_sid(producer)
             # outside of stages, not consider
             if psid is None: continue
 
             # group consumers into stages
-            consumers = self.consumers(ftensor)
+            consumers = self.consumers(fobj)
             csids = [get_sid(consumer) for consumer in consumers]
-            buckets = [[] for _ in range(len(fstages))]
+            buckets: List[List[IRFwOperation]] = [[] for _ in range(len(fstages))]
             for idx, csid in enumerate(csids):
                 buckets[csid].append(consumers[idx])
 
             # go through each stage to generate identity operators
-            out = ptensor
+            out = pobj
             end_sid = max(csids) + 1
             for sid in range(psid + 1, end_sid):
                 # insert identity
                 op = insert_identity(out, sid)
                 out = op.output(0)
-                # calculate gradient
-                curr_valmap = ValueMap((0, 1))
-                nconsumers = len(buckets[sid])
-                fgrad = ftensor.grad
-                for cidx, consumer in enumerate(buckets[sid]):
-                    if fgrad is None:
-                        grad = None
-                    else:
-                        valmap = curr_valmap.map((0, 2)) if cidx != nconsumers - 1 else curr_valmap
-                        grad = fgrad.select(ptensor.indmap, valmap)
-                        curr_valmap = curr_valmap.map((1, 2)) if cidx != nconsumers - 1 else curr_valmap
-                    # update forward consumer
-                    idx = consumer.inputs().index(ptensor)
-                    tensor = consumer.input(idx)
-                    with self.update(consumer) as consumer:
-                        consumer.set_input(idx, out)
-                        consumer.input(idx).grad = grad
-                    # update backward
-                    if tensor.grad is not None:
-                        with self.update(consumer.mirror) as bconsumer:
-                            idx = bconsumer.outputs().index(tensor.grad)
-                            bconsumer.set_output(idx, grad)
+
+                if isinstance(fobj, IRTensor):
+                    # calculate gradient
+                    curr_valmap = ValueMap((0, 1))
+                    nconsumers = len(buckets[sid])
+                    fgrad = fobj.grad
+                    for cidx, consumer in enumerate(buckets[sid]):
+                        if fgrad is None:
+                            grad = None
+                        else:
+                            valmap = curr_valmap.map((0, 2)) if cidx != nconsumers - 1 else curr_valmap
+                            grad = fgrad.select(pobj.indmap, valmap)
+                            curr_valmap = curr_valmap.map((1, 2)) if cidx != nconsumers - 1 else curr_valmap
+                        # update forward consumer
+                        idx = consumer.inputs().index(pobj)
+                        tensor = consumer.input(idx)
+                        with self.update(consumer) as consumer:
+                            consumer.set_input(idx, out)
+                            consumer.input(idx).grad = grad
+                        # update backward
+                        if tensor.grad is not None:
+                            with self.update(consumer.mirror) as bconsumer:
+                                idx = bconsumer.outputs().index(tensor.grad)
+                                bconsumer.set_output(idx, grad)
+                else:
+                    # IRObject without gradient, just update consumer
+                    for consumer in buckets[sid]:
+                        with self.update(consumer) as consumer:
+                            consumer.replace_input(pobj, out)
 
         # grouping into segment
         for sid in range(len(fstages)):
             self.group(fstages[sid])
-
 
     # ================= Other optimizations ==================
 
@@ -1219,7 +1245,7 @@ class IRGraph(IRSegment):
     def copy_node_meta_info(src_node: Union[IRFwOperation, IRDataOperation], dest_node: Union[IRFwOperation, IRDataOperation]):
         """
         Copy meta information from src_node to dest_node.
-        Current copy fields: ['recompute', 'comment', 'op_context', 'module_stack', 'device',
+        Current copy fields: ['recompute', 'comment', 'op_context', 'module_stack', 'module_call_stack', 'device',
         'hook_meta', 'pre_hook', 'post_hook']
         """
         if isinstance(src_node, IRFwOperation):
@@ -1229,7 +1255,127 @@ class IRGraph(IRSegment):
         if src_node.op_context is not None:
             dest_node.op_context = src_node.op_context
         dest_node.module_stack = src_node.module_stack
+        dest_node.module_call_stack = src_node.module_call_stack
         dest_node.device = src_node.device
         dest_node.hook_meta = src_node.hook_meta
         dest_node.pre_hook = src_node.pre_hook
         dest_node.post_hook = src_node.post_hook
+
+    # ================= Graph Expander ==================
+    #
+    # About graph/segment expanders:
+    #
+    # Previously every device that owned a (forward/backward) segment held the
+    # *full* segment input/output tensors, and adapters were generated against
+    # that full IO. Expander introduces an explicit expand pass that builds
+    # *per-device* segment IO and lets segments be "narrowed", so each device
+    # only keeps the slice of the segment IO it actually produces/consumes
+    # (e.g. tp partition mapped onto multiple
+    # devices) to reduce redundant communication.
+    #
+    # Two-tier expander:
+    #   - IRGraphExpander  (whole-graph driver, below): iterates fw segments,
+    #     calls build_expander() on each, and caches per_device_ios so that
+    #     producers/consumers can be rewired to the right per-device tensors.
+    #   - IRSegmentExpander (in segment.py): computes per-device inputs/outputs,
+    #     mirrors them to the backward segment (grads), and narrows segment IO
+    #     when shapes allow.
+    #
+    # Lifecycle: build_expander() -> build_io() (compute & cache per-device IO),
+    # then expand() materializes the per-device segments. adjust_*_for_per_device_seg
+    # rewire a producer/consumer that is itself a per-device segment to its
+    # narrowed per-device tensor so adapters connect the correct shards.
+    #
+    def build_expander(self):
+        """
+        Build per-device input/output for each segment in the graph.
+        This is used to prepare for adapter generation.
+        """
+        if self.expander is not None:
+            return
+
+        self.expander = IRGraphExpander(self)
+        self.expander.build_io()
+
+    def expand(self):
+        self.expander.expand()
+
+    def is_partitioned_segment_io(self, tensor: IRFullTensor):
+        # graph never has partitioned segment IO, only segments can have partitioned IO
+        return False
+
+    def adjust_producer_for_per_device_seg(self, producers: List[IRCell], ptensors: List[IRSubTensor]):
+        assert self.expander is not None, "Please call build_expander() before adjusting producers for per-device segments"
+        return self.expander.adjust_producer_for_per_device_seg(producers, ptensors)
+
+    def adjust_consumer_for_per_device_seg(self, consumers: List[IRCell], ctensors: List[IRSubTensor]):
+        assert self.expander is not None, "Please call build_expander() before adjusting consumers for per-device segments"
+        return self.expander.adjust_consumer_for_per_device_seg(consumers, ctensors)
+
+
+class IRGraphExpander:
+    def __init__(self, graph: IRGraph):
+        if not isinstance(graph, IRGraph):
+            raise TypeError(f"Expect IRGraph but got: {type(graph)}")
+
+        self._graph = graph
+        self.per_device_ios: Dict[
+            IRSegment, Tuple[Dict[int, List[IRObject]], Dict[int, List[IRObject]]]
+        ] = {}
+        self.dataloader_outputs = set()
+        self.graph_outputs = set()
+        self.io_built = False
+
+    def build_io(self):
+        if self.io_built:
+            return
+
+        for node in self._graph.nodes():
+            if isinstance(node, IRDataOperation):
+                self.dataloader_outputs.update(obj.parent for obj in IR.get_objects(node.outputs()))
+        self.graph_outputs.update(obj.parent for obj in IR.get_objects(self._graph.outputs()))
+
+        for node in self._graph.nodes():
+            if isinstance(node, IRSegment) and node.isfw():
+                node.build_expander(self.dataloader_outputs, self.graph_outputs)
+                self.per_device_ios[node] = node.expander.get_per_device_inout()
+                if node.mirror is not None:
+                    self.per_device_ios[node.mirror] = node.mirror.expander.get_per_device_inout()
+
+        self.io_built = True
+
+    def expand(self):
+        for segment in self._graph.nodes():
+            if isinstance(segment, IRSegment) and segment.isfw():
+                segment.expand()
+
+    def _adjust_segment_io(self, cells, tensors, *, output: bool):
+        assert len(cells) == len(tensors), "cells and tensors should have the same length"
+        assert self.io_built, "Please call build_io() before adjusting per-device segment IO"
+
+        adjusted_cells = []
+        adjusted_tensors = []
+        io_side = 1 if output else 0
+        for cell, tensor in zip(cells, tensors):
+            if cell not in self.per_device_ios:
+                adjusted_cells.append(cell)
+                adjusted_tensors.append(tensor)
+                continue
+
+            cell_ios = cell.outputs() if output else cell.inputs()
+            index = IR.index_with_same_parent(tensor, cell_ios)
+            if index is None:
+                adjusted_cells.append(cell)
+                adjusted_tensors.append(tensor)
+                continue
+
+            for per_device_io in self.per_device_ios[cell][io_side].values():
+                adjusted_cells.append(cell)
+                adjusted_tensors.append(per_device_io[index])
+        return adjusted_cells, adjusted_tensors
+
+    def adjust_producer_for_per_device_seg(self, producers: List[IRCell], ptensors: List[IRSubTensor]):
+        return self._adjust_segment_io(producers, ptensors, output=True)
+
+    def adjust_consumer_for_per_device_seg(self, consumers: List[IRCell], ctensors: List[IRSubTensor]):
+        return self._adjust_segment_io(consumers, ctensors, output=False)

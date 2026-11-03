@@ -23,7 +23,8 @@ class ExeReuseCell(IRCell):
     """
 
     def __init__(self, cell: IRCell,
-                 inputs: List[IRSubTensor], outputs: List[IRCell]):
+                 inputs: List[IRSubTensor], outputs: List[IRCell],
+                 micro_batch_id: Optional[int] = None):
         assert len(inputs) == len(cell.inputs())
         assert len(outputs) == len(cell.outputs()), (
             f"output length mismatch: {cell}\n"
@@ -36,6 +37,7 @@ class ExeReuseCell(IRCell):
             self.set_output(idx, t)
         self._cell: IRCell = cell
         self._cached_dispatched: Dict[int, ExeReuseCell] = {}
+        self._micro_batch_id = micro_batch_id
 
     @property
     def device(self) -> int:
@@ -45,6 +47,10 @@ class ExeReuseCell(IRCell):
     def cell(self) -> IRCell:
         return self._cell
 
+    @property
+    def micro_batch_id(self) -> Optional[int]:
+        return self._micro_batch_id
+
     def isfw(self) -> bool:
         return self._cell.isfw()
 
@@ -53,17 +59,61 @@ class ExeReuseCell(IRCell):
         if devid in self._cached_dispatched:
             return self._cached_dispatched[devid]
 
-        inputs = []
-        for t, cell_t in zip(self._inputs, self._cell.inputs()):
-            if isinstance(cell_t, IRSubTensor) and devid not in cell_t.device:
-                continue
-            inputs.append(t)
-        outputs = []
-        for t, cell_t in zip(self._outputs, self._cell.outputs()):
-            if isinstance(cell_t, IRSubTensor) and devid not in cell_t.device:
-                continue
-            outputs.append(t)
-        reuse = ExeReuseCell(self._cell.dispatch(devid), inputs, outputs)
+        dispatch_cell = self._cell.dispatch(devid)
+
+        def align_with_dispatched(cell_objs, reuse_objs, dispatched_objs):
+            pairs = list(zip(cell_objs, reuse_objs))
+            used = set()
+            aligned = []
+            for dispatched_obj in dispatched_objs:
+                if isinstance(dispatched_obj, IRSubTensor):
+                    exact = [
+                        idx for idx, (cell_obj, _) in enumerate(pairs)
+                        if idx not in used and isinstance(cell_obj, IRSubTensor)
+                        and cell_obj.tid == dispatched_obj.tid
+                    ]
+                    parent_matches = [
+                        idx for idx, (cell_obj, _) in enumerate(pairs)
+                        if idx not in used and isinstance(cell_obj, IRSubTensor)
+                        and cell_obj.parent.tid == dispatched_obj.parent.tid
+                    ]
+                    candidates = exact[:1] if exact else parent_matches
+                else:
+                    candidates = [
+                        idx for idx, (cell_obj, _) in enumerate(pairs)
+                        if idx not in used
+                        and (cell_obj is dispatched_obj or cell_obj == dispatched_obj)
+                    ][:1]
+                assert len(candidates) == 1, (
+                    f"Cannot align dispatched reuse object {dispatched_obj} "
+                    f"from cell {self._cell}: candidates={candidates}"
+                )
+                match_idx = candidates[0]
+                used.add(match_idx)
+                reuse_obj = pairs[match_idx][1]
+                if isinstance(reuse_obj, IRSubTensor) and isinstance(dispatched_obj, IRSubTensor) \
+                        and (reuse_obj.indmap != dispatched_obj.indmap
+                             or reuse_obj.valmap != dispatched_obj.valmap):
+                    grad = reuse_obj.grad
+                    narrowed = reuse_obj.parent.select(dispatched_obj.indmap, dispatched_obj.valmap)
+                    if grad is not None:
+                        assert isinstance(dispatched_obj.grad, IRSubTensor), \
+                            f"Expected IRSubTensor, got {type(dispatched_obj.grad)}"
+                        narrowed.grad = grad.parent.select(dispatched_obj.grad.indmap, dispatched_obj.grad.valmap)
+                    reuse_obj = narrowed
+                aligned.append(reuse_obj)
+            return aligned
+
+        inputs = align_with_dispatched(
+            self._cell.inputs(), self._inputs, dispatch_cell.inputs()
+        )
+        outputs = align_with_dispatched(
+            self._cell.outputs(), self._outputs, dispatch_cell.outputs()
+        )
+        reuse = ExeReuseCell(
+            dispatch_cell, inputs, outputs,
+            micro_batch_id=self._micro_batch_id
+        )
         reuse._id = self._id
         reuse._op_context = self._op_context
         if _mirror and self.mirror is not None:
@@ -138,13 +188,19 @@ class ExecutionPlan:
                     return micro_fcells[key]
                 inputs = [get(t, node.mid) for t in node.content.inputs()]
                 outputs = [get(t, node.mid) for t in node.content.outputs()]
-                cell = ExeReuseCell(node.content, inputs, outputs)
+                cell = ExeReuseCell(
+                    node.content, inputs, outputs,
+                    micro_batch_id=node.mid
+                )
                 if node.stream_context is not None:
                     cell.set_op_context('stream_context', node.stream_context)
                 if isinstance(node.content.mirror, IRCell):
                     minputs = [get(t, node.mid) for t in node.content.mirror.inputs()]
                     moutputs = [get(t, node.mid) for t in node.content.mirror.outputs()]
-                    mcell = ExeReuseCell(node.content.mirror, minputs, moutputs)
+                    mcell = ExeReuseCell(
+                        node.content.mirror, minputs, moutputs,
+                        micro_batch_id=node.mid
+                    )
                     IRCell.make_pair(cell, mcell)
                 micro_fcells[key] = cell
                 return cell
@@ -236,7 +292,16 @@ class ExecutionPlan:
             for idx in range(len(nodes)):
                 node = nodes[idx]
                 # print(f'handling {node}')
-                if len(node.device) == 1: continue  # no need for dispatch
+                if len(node.device) == 1:
+                    # Single-device segments still need dispatch when their
+                    # per-device IO has been narrowed by IRSegmentExpander.
+                    # Without dispatch, the ExeReuseCell keeps the original
+                    # (un-narrowed) output tensor IDs while inter-segment
+                    # adapters reference the narrowed tensor IDs, causing
+                    # UnboundLocalError in the generated schedule code.
+                    unwrap = node.cell if isinstance(node, ExeReuseCell) else node
+                    if not isinstance(unwrap, IRSegment) or unwrap.expander is None:
+                        continue
                 dnode = cached_dispatch(node, devid, dispatched)
                 nodes[idx] = dnode
 

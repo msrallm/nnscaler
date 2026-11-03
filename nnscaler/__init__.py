@@ -15,6 +15,7 @@ from .parallel import (
     load_deduped_state_dict,
     broadcast_weights,
     load_sharded_state_dict,
+    align_state_dict_names,
     sync_grad_when,
     trimmed_broadcast_merged_state_dict,
     load_merged_state_dict_from_rank,
@@ -61,7 +62,9 @@ def uninit():
     """
     Uninitialize the nnscaler library.
 
-    It will destroy the torch distributed nccl process_group
+    It releases NNScaler's subgroups in a consistent order, then destroys the
+    default process group if NNScaler initialized it. Call this before destroying
+    an externally initialized default group.
 
     Returns:
         None
