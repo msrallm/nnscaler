@@ -856,6 +856,13 @@ class Bucket:
         """
         if not self._async:
             return
+        # The merged engine owns microbatch accounting while its window is open:
+        # a stale train_step()-era _grad_accumulation_steps would void the
+        # skip_reducer copy-only invariant during recording and skew the launch
+        # gate afterwards. Upstream's Reducer-level set_async_grad_expected_counts
+        # zeroes it for the same reason ('a scheduled plan supersedes train_step's
+        # uniform microbatch count'); mirror that at window-open.
+        self._grad_accumulation_steps = 0
         self._async_record_counts = {}
 
     def end_record_async_hook_counts(self):
