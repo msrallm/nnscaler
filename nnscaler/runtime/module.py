@@ -2250,6 +2250,18 @@ class ParallelModule(CubeModule):
 
             # None means the parameter is not in this rank (pipeline parallelism)
             local_attr_name = pas[self.rank][0] if pas[self.rank] else None
+            # Globally consistent buffer skip (default): the owner-local
+            # 'not in state_dict' predicate below desyncs the per-attr
+            # collectives once a non-persistent buffer is PP-SHARDED (ref_kl
+            # frozen reference weights) -- owner ranks skip while non-owner
+            # ranks enter the DTensor broadcast leg and wait forever. Buffers
+            # never reached merged state dicts on this lineage anyway (the
+            # replicated rope caches were owner-skipped on every rank), so skip
+            # every non-param attr uniformly from the metas every rank already
+            # shares. OPD_SYNC_NP_GLOBAL=0 restores the legacy local check.
+            if os.environ.get('OPD_SYNC_NP_GLOBAL', '1') == '1':
+                if any(m is not None and not m.is_param for m in metas):
+                    continue
             # Skip non-persistent buffers (e.g. rope_cos_sin_cache) that appear in
             # attr_meta_map but are not included in state_dict.
             if local_attr_name and local_attr_name not in state_dict:
