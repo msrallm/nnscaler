@@ -791,47 +791,61 @@ def broadcast_files(
     file_groups = [pair[0] for pair in file_groups_sizes_pairs]
     file_group_sizes = [pair[1] for pair in file_groups_sizes_pairs]
 
-    def _write_file(file: Union[str, Path], buffer, start, size):
-        _logger.info(f'Rank {curr_rank}: Writing file {file} of size {size} bytes.')
-        # have better performance than open + write
-        buffer[start: start + size].numpy().tofile(file)
+    # Stream every group through ONE reusable fixed-size staging pair (pinned
+    # CPU + CUDA) instead of a fresh torch.empty(total_size) per group. Groups
+    # inherit the size of their largest attr file (fused MoE expert banks are
+    # 10GiB+, saved whole), and with ~100+ groups of DISTINCT sizes neither the
+    # caching device allocator nor the caching host allocator can reuse blocks:
+    # reserved VRAM and pinned host memory grow with the number of distinct
+    # sizes and eventually fail allocation (first live hit: 150B ref_kl trace,
+    # 310 gen files, cudaHostAlloc failure inside _send_file_group). Chunking
+    # bounds both at NNSCALER_BCAST_CHUNK_BYTES (default 2GiB; must be equal on
+    # every rank) regardless of file count or size, with an identical collective
+    # structure on all ranks (chunk counts derive from the broadcasted sizes).
+    chunk_bytes = int(os.environ.get('NNSCALER_BCAST_CHUNK_BYTES', 2 << 30))
+    max_group = max((sum(sizes) for sizes in file_group_sizes), default=0)
+    staging = min(chunk_bytes, max_group)
+    if staging > 0:
+        pinned = torch.empty(staging, dtype=torch.uint8, device='cpu').pin_memory()
+        device_buf = torch.empty(staging, dtype=torch.uint8, device='cuda')
 
-    def _read_file(file, buffer, start, size):
-        _logger.info(f'Rank {curr_rank}: Reading file {file} of size {size} bytes.')
-        # slightly faster than open + read
-        buffer[start: start + size] = torch.from_numpy(np.fromfile(file, dtype=np.uint8))
-
-    def _write_files(buffer, files, file_sizes):
-        buffer = buffer.cpu()
-        file_starts = itertools.accumulate([0] + file_sizes[:-1])
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            executor.map(
-                lambda args: _write_file(args[0], buffer, args[1], args[2]),
-                zip(files, file_starts, file_sizes)
-            )
+    def _file_ranges(files, file_sizes, lo, hi):
+        """Yield (file, file_offset, buffer_offset, nbytes) covering [lo, hi)."""
+        pos = 0
+        for file, size in zip(files, file_sizes):
+            a, b = max(lo, pos), min(hi, pos + size)
+            if a < b:
+                yield file, a - pos, a - lo, b - a
+            pos += size
+            if pos >= hi:
+                break
 
     def _send_file_group(src, files, file_sizes):
         total_size = sum(file_sizes)
-
         group = groups[src]
-        file_buffer = torch.empty(total_size, dtype=torch.uint8, device='cpu').pin_memory()
-
-        if curr_rank < local_world_size:
-            file_starts = itertools.accumulate([0] + file_sizes[:-1])
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                executor.map(
-                    lambda args: _read_file(args[0], file_buffer, args[1], args[2]),
-                    zip(files, file_starts, file_sizes)
-                )
-            broadcast_tensor = file_buffer.cuda()
-        else:
-            broadcast_tensor = torch.empty(total_size, dtype=torch.uint8, device='cuda')
-
-        torch.distributed.broadcast(broadcast_tensor, src=src, group=group)
-
-        if curr_rank >= local_world_size:
-            file_buffer.copy_(broadcast_tensor)
-            _write_files(file_buffer, files, file_sizes)
+        sender = curr_rank < local_world_size
+        if not sender:
+            # pre-size outputs so ranged writes can seek into them
+            for file, size in zip(files, file_sizes):
+                with open(file, 'wb') as f:
+                    f.truncate(size)
+        for lo in range(0, total_size, staging):
+            n = min(staging, total_size - lo)
+            if sender:
+                for file, f_off, b_off, nbytes in _file_ranges(files, file_sizes, lo, lo + n):
+                    _logger.debug(f'Rank {curr_rank}: reading {file} [{f_off}:{f_off + nbytes}]')
+                    pinned[b_off:b_off + nbytes] = torch.from_numpy(
+                        np.fromfile(file, dtype=np.uint8, count=nbytes, offset=f_off))
+                device_buf[:n].copy_(pinned[:n])
+            torch.distributed.broadcast(device_buf[:n], src=src, group=group)
+            if not sender:
+                pinned[:n].copy_(device_buf[:n])
+                view = pinned[:n].numpy()
+                for file, f_off, b_off, nbytes in _file_ranges(files, file_sizes, lo, lo + n):
+                    _logger.debug(f'Rank {curr_rank}: writing {file} [{f_off}:{f_off + nbytes}]')
+                    with open(file, 'r+b') as f:
+                        f.seek(f_off)
+                        f.write(view[b_off:b_off + nbytes].tobytes())
 
     # we split the file groups among local ranks
     # each local rank sends its assigned file groups (in round robin fashion)
