@@ -36,6 +36,8 @@ def _build(model, data, policy, skip, tag):
 
 
 def _step(pm, samples, is_dummy, active):
+    for p in pm.parameters():
+        p.grad = None
     RuntimeFlag.active_micros = active
     try:
         outputs = pm.train_step(samples, is_dummy_batch=is_dummy)
@@ -74,10 +76,14 @@ def worker_skip_dummy(policy_name):
     assert '_n_active' in src_on and 'if 3 < _n_active:' in src_on
 
     out_ref, g_ref = _step(pm_off, samples, is_dummy, None)
-    out_skip, g_skip = _step(pm_on, samples, is_dummy, 2)
-    _assert_same_grads(g_ref, g_skip)
-    out_full, g_full = _step(pm_on, samples, is_dummy, None)
-    _assert_same_grads(g_ref, g_full)
+    _, g_ref2 = _step(pm_off, samples, is_dummy, None)
+    _assert_same_grads(g_ref, g_ref2)  # reference is deterministic step to step
+    # alternate skipped / full steps: no state may leak from a skipped step
+    for active in (2, None, 2, None):
+        out, g = _step(pm_on, samples, is_dummy, active)
+        _assert_same_grads(g_ref, g)
+        if active == 2:
+            out_skip = out
 
     rank = torch.distributed.get_rank()
     print(f'[rank{rank}] {policy_name}: skip outputs {[None if o is None else "t" for o in out_skip]}')
