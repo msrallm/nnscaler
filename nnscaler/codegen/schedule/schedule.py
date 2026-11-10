@@ -99,8 +99,6 @@ class ScheduleCodeGen(FuncEmission):
         # when we use scheduler (i.e. pipeline parallelism)
         # Otherwise, the caller of `_train_step` will set these flags to support gradient accumulation
         use_scheduler = self.execplan.graph.sched is not None
-        send_bundle_ranges = self._collect_send_bundle_ranges(device_nodes, device_map) \
-            if use_scheduler else {}
 
         assert all(not isinstance(n, IRFwOperation) for n in device_nodes), \
             "Expected all forward operators have been grouped into IRSegment"
@@ -116,6 +114,86 @@ class ScheduleCodeGen(FuncEmission):
 
         last_stream = None
         buffered_codes = []
+
+        # Dummy-micro skipping: trailing micro-batches beyond RuntimeFlag.active_micros
+        # are skipped on every stage. Every per-micro node (forward/backward segment and
+        # its p2p adapters, recv waits, send bundles, releases) carries the same guard,
+        # so sender and receiver of each p2p pair always agree; weight reducers stay
+        # unguarded and sync once at the end, exactly as for a full step.
+        micro_ids = [n.micro_batch_id for n in device_nodes
+                     if isinstance(n, ExeReuseCell) and n.micro_batch_id is not None]
+        skip_dummy = bool(use_scheduler and CompileFlag.skip_dummy_micros and micro_ids)
+        if skip_dummy and CompileFlag.async_reducer:
+            _logger.warning('skip_dummy_micros is ignored with async_reducer: '
+                            'its bucket contribution counts assume every micro-batch runs')
+            skip_dummy = False
+        nmicros = max(micro_ids) + 1 if micro_ids else 0
+        if skip_dummy:
+            # A p2p adapter outside any micro-batch could not be skipped together
+            # with its peer and would block forever; fall back to running everything.
+            unguarded_p2p = [
+                n for n in device_nodes
+                if not isinstance(n, ExeReuseCell) and isinstance(n, IRAdapter)
+                and any(isinstance(p, MovePrim) for p in n.prims)
+            ]
+            if unguarded_p2p:
+                _logger.warning(f'skip_dummy_micros disabled on device {device}: '
+                                f'{len(unguarded_p2p)} p2p adapters carry no micro-batch id')
+                skip_dummy = False
+        send_bundle_ranges = self._collect_send_bundle_ranges(
+            device_nodes, device_map, split_by_micro=skip_dummy) if use_scheduler else {}
+
+        def _node_guard(node: IRCell) -> Optional[int]:
+            if skip_dummy and isinstance(node, ExeReuseCell):
+                return node.micro_batch_id
+            return None
+
+        def _guarded(codes: List[str], guard: Optional[int]) -> List[str]:
+            if guard is None or not codes:
+                return codes
+            lines = []
+            for code in codes:
+                lines.extend(code.split('\n'))
+            # `pass` keeps the block valid if text post-processing
+            # (_remove_dead_dataloader_reads) strips its other lines.
+            return [f'if {guard} < _n_active:', '    pass'] + \
+                [('    ' + line) if line else line for line in lines]
+
+        # micro-batch of every object a guarded node defines, so a release emitted
+        # after an unguarded line only deletes names its micro-batch really created
+        tid_micro: Dict[int, int] = {}
+        for n in device_nodes:
+            g = _node_guard(n)
+            if g is None:
+                continue
+            plan = sample_reads.get(n)
+            defined = list(IRSegment.get_objects_from_complex(n.outputs()))
+            if plan is not None:
+                defined += list(plan.outputs)
+            for obj in defined:
+                if isinstance(obj, IRObject):
+                    tid_micro.setdefault(obj.tid, g)
+
+        def _release_groups(tensors, guard: Optional[int]):
+            if guard is not None or not skip_dummy:
+                return [(guard, list(tensors))]
+            groups: Dict[Optional[int], list] = {}
+            for t in tensors:
+                groups.setdefault(tid_micro.get(t.tid), []).append(t)
+            return list(groups.items())
+
+        def _active_prologue() -> List[str]:
+            if not skip_dummy:
+                return []
+            codes = [
+                '_n_active = nnscaler.flags.RuntimeFlag.active_micros',
+                f'_n_active = {nmicros} if _n_active is None else _n_active',
+            ]
+            # outputs of skipped micro-batches are never produced: return None for them
+            for obj in IR.get_objects(self.execplan.outputs()):
+                if isinstance(obj, IRObject):
+                    codes.append(f'{self.tensor_name(obj)} = None')
+            return codes
 
 
         def to_tensor_names(val) -> str:
@@ -134,8 +212,9 @@ class ScheduleCodeGen(FuncEmission):
                     stream_block.insert_body(codes)
                 return stream_block.code + ['']
 
-        def _append_code(fb: FunctionBlock, code: Union[List[str], str], stream: Optional[str] = None, force_flush=False):
-            codes = code if isinstance(code, list) else [code]
+        def _append_code(fb: FunctionBlock, code: Union[List[str], str], stream: Optional[str] = None, force_flush=False,
+                         guard: Optional[int] = None):
+            codes = _guarded(code if isinstance(code, list) else [code], guard)
 
             nonlocal last_stream, buffered_codes
 
@@ -155,7 +234,8 @@ class ScheduleCodeGen(FuncEmission):
                 buffered_codes.clear()
                 last_stream = None
 
-        def _append_send_bundle_events(fb: FunctionBlock, events, before_node: bool):
+        def _append_send_bundle_events(fb: FunctionBlock, events, before_node: bool,
+                                       guard: Optional[int] = None):
             methods = {
                 'reserve': 'reserve_send_bundle',
                 'begin': 'begin_send_bundle',
@@ -167,6 +247,7 @@ class ScheduleCodeGen(FuncEmission):
                         fb,
                         'nnscaler.runtime.executor.AsyncCommHandler()'
                         f'.{method_name}({args})',
+                        guard=guard,
                     )
 
         with FunctionBlock(func_name='_train_step',
@@ -184,6 +265,9 @@ class ScheduleCodeGen(FuncEmission):
             if use_scheduler and CompileFlag.async_reducer:
                 for code in self._emit_async_reducer_expectations(device_nodes):
                     _append_code(fb, code)
+            prologue = _active_prologue()
+            if prologue:
+                _append_code(fb, prologue)
 
             # body code
             if len(device_nodes) == 0:
@@ -217,11 +301,12 @@ class ScheduleCodeGen(FuncEmission):
                 pending_async_recvs = {}
                 for line, node in enumerate(device_nodes):
                     unwrap_node = node.cell if isinstance(node, ExeReuseCell) else node
+                    guard = _node_guard(node)
                     bundle_events = send_bundle_ranges.get(line, ())
-                    _append_send_bundle_events(fb, bundle_events, before_node=True)
+                    _append_send_bundle_events(fb, bundle_events, before_node=True, guard=guard)
                     wait_codes = self._emit_async_recv_waits(node, pending_async_recvs, produced_tids)
                     if wait_codes:
-                        _append_code(fb, wait_codes, self._get_node_stream(node))
+                        _append_code(fb, wait_codes, self._get_node_stream(node), guard=guard)
 
                     # when use scheduler, skip reducer if it is not the last backward of same segments
                     if use_scheduler and _is_backward_segment(node):
@@ -233,7 +318,8 @@ class ScheduleCodeGen(FuncEmission):
                             skip_reducer = False
                         _append_code(fb,
                             f'nnscaler.flags.RuntimeFlag.skip_reducer = '
-                            f'{skip_reducer !r}'
+                            f'{skip_reducer !r}',
+                            guard=guard,
                         )
                     elif use_scheduler and isinstance(unwrap_node, IRWeightReducer):
                         _append_code(fb, 'nnscaler.flags.RuntimeFlag.skip_reducer = False')
@@ -242,16 +328,17 @@ class ScheduleCodeGen(FuncEmission):
                         produced_tids=produced_tids,
                         sample_reads=sample_reads.get(node),
                     )
-                    _append_code(fb, codes, self._get_node_stream(node))
+                    _append_code(fb, codes, self._get_node_stream(node), guard=guard)
                     self._track_async_recv(node, pending_async_recvs)
                     # release
                     tensors = lifetime.release_tensors_after_line(line)
                     if len(tensors) > 0 : # not necessarily to have one after each line
-                        _append_code(fb, self.emit_release(tensors))
+                        for rel_guard, rel_tensors in _release_groups(tensors, guard):
+                            _append_code(fb, self.emit_release(rel_tensors), guard=rel_guard)
                     for out in IRSegment.get_objects_from_complex(node.outputs()):
                         if isinstance(out, IRObject):
                             produced_tids.add(out.tid)
-                    _append_send_bundle_events(fb, bundle_events, before_node=False)
+                    _append_send_bundle_events(fb, bundle_events, before_node=False, guard=guard)
             # return code
             if CompileFlag.async_comm:
                 _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain_sends()')
@@ -273,6 +360,9 @@ class ScheduleCodeGen(FuncEmission):
         else:
             with FunctionBlock(func_name='_infer_step', args=args) as fb:
                 _append_code(fb, '_ = None')
+                prologue = _active_prologue()
+                if prologue:
+                    _append_code(fb, prologue)
                 # body code
                 if len(device_nodes) == 0:
                     _append_code(fb, 'pass')
@@ -283,13 +373,14 @@ class ScheduleCodeGen(FuncEmission):
                 infer_pending_async_recvs = {}
                 for line, node in enumerate(device_nodes):
                     if not node.isfw(): continue  # skip backward segments and adapters
+                    guard = _node_guard(node)
                     bundle_events = send_bundle_ranges.get(line, ())
-                    _append_send_bundle_events(fb, bundle_events, before_node=True)
+                    _append_send_bundle_events(fb, bundle_events, before_node=True, guard=guard)
                     wait_codes = self._emit_async_recv_waits(
                         node, infer_pending_async_recvs, infer_produced_tids
                     )
                     if wait_codes:
-                        _append_code(fb, wait_codes, self._get_node_stream(node))
+                        _append_code(fb, wait_codes, self._get_node_stream(node), guard=guard)
 
                     # execute
                     codes = self.emit_node(
@@ -298,17 +389,18 @@ class ScheduleCodeGen(FuncEmission):
                         produced_tids=infer_produced_tids,
                         sample_reads=sample_reads.get(node),
                     )
-                    _append_code(fb, codes, self._get_node_stream(node))
+                    _append_code(fb, codes, self._get_node_stream(node), guard=guard)
                     self._track_async_recv(node, infer_pending_async_recvs)
                     # release
                     tensors = lifetime.release_tensors_after_line(line)
                     tensors = [t for t in tensors if not isinstance(t, IRTensor) or not t.is_grad()]
                     if len(tensors) > 0 : # not necessarily to have one after each line
-                        _append_code(fb, self.emit_release(tensors))
+                        for rel_guard, rel_tensors in _release_groups(tensors, guard):
+                            _append_code(fb, self.emit_release(rel_tensors), guard=rel_guard)
                     for out in IRSegment.get_objects_from_complex(node.outputs()):
                         if isinstance(out, IRObject):
                             infer_produced_tids.add(out.tid)
-                    _append_send_bundle_events(fb, bundle_events, before_node=False)
+                    _append_send_bundle_events(fb, bundle_events, before_node=False, guard=guard)
                 # return code
                 if CompileFlag.async_comm:
                     _append_code(fb, 'nnscaler.runtime.executor.AsyncCommHandler().drain_sends()')
@@ -345,8 +437,15 @@ class ScheduleCodeGen(FuncEmission):
         return tuple(sorted(links)) or None
 
     @classmethod
-    def _collect_send_bundle_ranges(cls, nodes: List[IRCell], device: int):
-        """Group adjacent pipeline sends to the same physical link into bundles."""
+    def _collect_send_bundle_ranges(cls, nodes: List[IRCell], device: int, split_by_micro: bool = False):
+        """Group adjacent pipeline sends to the same physical link into bundles.
+
+        With ``split_by_micro`` a bundle never spans two micro-batches, so a
+        skipped micro-batch drops its whole reserve/begin/end triple.
+        """
+        def _micro(node: IRCell):
+            return node.micro_batch_id if isinstance(node, ExeReuseCell) else None
+
         events = {}
         line = 0
         while line < len(nodes):
@@ -361,6 +460,7 @@ class ScheduleCodeGen(FuncEmission):
                 end + 1 < len(nodes)
                 and nodes[end + 1].isfw() == is_forward
                 and cls._pipeline_send_key(nodes[end + 1], device) == key
+                and (not split_by_micro or _micro(nodes[end + 1]) == _micro(nodes[line]))
             ):
                 end += 1
             input_tids = {

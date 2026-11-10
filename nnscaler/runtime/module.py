@@ -35,7 +35,7 @@ from nnscaler.runtime.utils import microbatches, set_dparam_meta, get_dparam_met
 from nnscaler.runtime.function import insert_backward_hook
 
 from nnscaler import __version__ as runtime_version
-from nnscaler.flags import CompileFlag
+from nnscaler.flags import CompileFlag, RuntimeFlag
 from nnscaler.utils import accum_mode, classproperty, unchecked_fields
 
 if TYPE_CHECKING:
@@ -1902,7 +1902,10 @@ class ParallelModule(CubeModule):
         self._sync_grad_required = False
         sample_count = len(samples)
         dataloader = microbatches(samples, cycle=False)
-        self.set_grad_accumulation_steps(sample_count)
+        active = RuntimeFlag.active_micros
+        if active is not None and not 1 <= int(active) <= sample_count:
+            raise ValueError(f"RuntimeFlag.active_micros={active} must be in [1, {sample_count}]")
+        self.set_grad_accumulation_steps(sample_count if active is None else int(active))
 
         if self.use_scheduler:
             if len(samples) != self.nmicros_per_scheduler_step:

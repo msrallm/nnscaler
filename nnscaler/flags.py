@@ -6,6 +6,7 @@ Environment flags for compiling options
 """
 
 import os
+from typing import Optional
 
 
 def _to_bool(s: str, default=False) -> bool:
@@ -41,6 +42,13 @@ class CompileFlag:
     # reduce scatter adapter can reduce the communication cost, and improve the performance
     # but sometimes it may cause communication bugs, so we provide an option to enable/disable it
     disable_reduce_scatter_adapter = _to_bool('DISABLE_REDUCE_SCATTER_ADAPTER', False)
+    # Pipeline schedules: guard every per-micro-batch node (compute, p2p, waits,
+    # releases) of the generated _train_step/_infer_step with
+    # `micro_batch_id < RuntimeFlag.active_micros`, so a step whose trailing
+    # micro-batches are padding can skip them on every stage consistently.
+    # Off: the generated code is unchanged. Not combinable with async_reducer
+    # (its per-bucket contribution counts assume every micro runs).
+    skip_dummy_micros = _to_bool('NNSCALER_SKIP_DUMMY_MICROS', False)
 
     # ============== runtime ====================
     dev_mode = _to_bool('SINGLE_DEV_MODE')  # allow to use python xx.py
@@ -119,3 +127,9 @@ class RuntimeFlag:
     # .and set to False at other accumulation steps.
     # By default False, which means the gradients will be reduced at the end of every iteration.
     skip_reducer: bool = False
+
+    # Number of leading micro-batches the next pipeline train/infer step executes;
+    # the remaining (trailing) ones are skipped on every stage. Only honored by code
+    # generated with CompileFlag.skip_dummy_micros. Every rank of a pipeline must set
+    # the same value. None means all micro-batches run.
+    active_micros: Optional[int] = None
